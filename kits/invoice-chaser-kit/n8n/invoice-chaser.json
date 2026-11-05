@@ -1,0 +1,299 @@
+{
+  "name": "Invoice Chaser",
+  "active": false,
+  "nodes": [
+    {
+      "id": "3d8e0e64-2222-4222-8222-000000000001",
+      "name": "Daily 08:30 Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [200, 300],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "30 8 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "3d8e0e64-2222-4222-8222-000000000002",
+      "name": "Fetch Open Invoices",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [420, 300],
+      "parameters": {
+        "url": "https://api.stripe.com/v1/invoices?status=open&limit=100",
+        "method": "GET",
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_STRIPE_RESTRICTED_KEY"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "3d8e0e64-2222-4222-8222-000000000003",
+      "name": "Evaluate Aging Ladder",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const items = $input.all();\nconst invoices = (items[0] && items[0].json && items[0].json.data) ? items[0].json.data : [];\nconst now = Math.floor(Date.now() / 1000);\nconst results = [];\n\nfor (const inv of invoices) {\n  if (!inv.due_date || inv.paid || inv.status !== 'open') continue;\n  const diffDays = Math.floor((now - inv.due_date) / (86400));\n  \n  // Strict reminder ladder: ONLY act on exactly day 3, 7, 14, or 30\n  let stage = null;\n  if (diffDays === 3) stage = 'day3';\n  else if (diffDays === 7) stage = 'day7';\n  else if (diffDays === 14) stage = 'day14';\n  else if (diffDays === 30) stage = 'day30';\n  \n  if (stage) {\n    results.push({\n      json: {\n        invoiceId: inv.id,\n        invoiceNumber: inv.number,\n        customerName: inv.customer_name || 'Valued Customer',\n        customerEmail: inv.customer_email,\n        amountDue: (inv.amount_due / 100).toFixed(2),\n        currency: (inv.currency || 'usd').toUpperCase(),\n        hostedInvoiceUrl: inv.hosted_invoice_url,\n        daysOverdue: diffDays,\n        stage: stage\n      }\n    });\n  }\n}\n\nreturn results;"
+      }
+    },
+    {
+      "id": "3d8e0e64-2222-4222-8222-000000000004",
+      "name": "Route Ladder Stage",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 1,
+      "position": [880, 300],
+      "parameters": {
+        "dataType": "string",
+        "value1": "={{ $json.stage }}",
+        "rules": {
+          "rules": [
+            { "value2": "day3" },
+            { "value2": "day7" },
+            { "value2": "day14" },
+            { "value2": "day30" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "3d8e0e64-2222-4222-8222-000000000005",
+      "name": "Draft Day 3 Polite",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 160],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const item = $input.item.json;\nconst subject = `Friendly reminder: Invoice ${item.invoiceNumber} is due`;\nconst body = `Hi ${item.customerName},\\n\\nHope you are having a productive week.\\n\\nJust a quick note that invoice ${item.invoiceNumber} for ${item.currency} ${item.amountDue} was due a few days ago. You can review and settle it securely here:\\n${item.hostedInvoiceUrl}\\n\\nIf you have already sent payment, please disregard this note.\\n\\nBest regards,`;\n\nreturn {\n  json: {\n    ...item,\n    action: 'send_email',\n    subject,\n    body\n  }\n};"
+      }
+    },
+    {
+      "id": "3d8e0e64-2222-4222-8222-000000000006",
+      "name": "Draft Day 7 Nudge",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 280],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const item = $input.item.json;\nconst subject = `Follow-up: Overdue invoice ${item.invoiceNumber}`;\nconst body = `Hi ${item.customerName},\\n\\nChecking in regarding invoice ${item.invoiceNumber} (${item.currency} ${item.amountDue}), which is now 7 days past due.\\n\\nPlease take a moment to complete payment via the link below:\\n${item.hostedInvoiceUrl}\\n\\nLet us know if you have questions or need us to update billing details.\\n\\nBest regards,`;\n\nreturn {\n  json: {\n    ...item,\n    action: 'send_email',\n    subject,\n    body\n  }\n};"
+      }
+    },
+    {
+      "id": "3d8e0e64-2222-4222-8222-000000000007",
+      "name": "Draft Day 14 Firm",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 400],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const item = $input.item.json;\nconst subject = `Urgent: Invoice ${item.invoiceNumber} is 14 days overdue`;\nconst body = `Dear ${item.customerName},\\n\\nWe have not yet received payment for invoice ${item.invoiceNumber} (${item.currency} ${item.amountDue}), due 14 days ago.\\n\\nPlease process payment today to avoid service interruptions:\\n${item.hostedInvoiceUrl}\\n\\nThank you for your prompt attention.`;\n\nreturn {\n  json: {\n    ...item,\n    action: 'send_email',\n    subject,\n    body\n  }\n};"
+      }
+    },
+    {
+      "id": "3d8e0e64-2222-4222-8222-000000000008",
+      "name": "Flag Day 30 Human Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 520],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const item = $input.item.json;\n// 30 days is kept for human review rather than sending an automated cold legal notice\nconst text = `🚨 *30-Day Overdue Invoice Attention Required*\\n• *Customer:* ${item.customerName} (${item.customerEmail})\\n• *Invoice:* ${item.invoiceNumber} (${item.currency} ${item.amountDue})\\n• *Overdue:* 30 days\\n• *Review Link:* ${item.hostedInvoiceUrl}\\n\\n*Action:* No email sent automatically. Please review account relationship.`;\n\nreturn {\n  json: {\n    ...item,\n    action: 'notify_admin_only',\n    slackText: text\n  }\n};"
+      }
+    },
+    {
+      "id": "3d8e0e64-2222-4222-8222-000000000009",
+      "name": "Dispatch Client Email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1400, 260],
+      "parameters": {
+        "url": "https://api.resend.com/emails",
+        "method": "POST",
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_EMAIL_API_KEY"
+            }
+          ]
+        },
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "from",
+              "value": "YOUR_SENDER_EMAIL"
+            },
+            {
+              "name": "to",
+              "value": "={{ $json.customerEmail }}"
+            },
+            {
+              "name": "subject",
+              "value": "={{ $json.subject }}"
+            },
+            {
+              "name": "text",
+              "value": "={{ $json.body }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "3d8e0e64-2222-4222-8222-000000000010",
+      "name": "Notify Slack Admin",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1400, 480],
+      "parameters": {
+        "url": "YOUR_SLACK_WEBHOOK_URL",
+        "method": "POST",
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "text",
+              "value": "={{ $json.slackText || `Sent ${$json.stage} reminder to ${$json.customerName} for ${$json.invoiceNumber}` }}"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 08:30 Schedule": {
+      "main": [
+        [
+          {
+            "node": "Fetch Open Invoices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Open Invoices": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Aging Ladder",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Aging Ladder": {
+      "main": [
+        [
+          {
+            "node": "Route Ladder Stage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Ladder Stage": {
+      "main": [
+        [
+          {
+            "node": "Draft Day 3 Polite",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Draft Day 7 Nudge",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Draft Day 14 Firm",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Flag Day 30 Human Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft Day 3 Polite": {
+      "main": [
+        [
+          {
+            "node": "Dispatch Client Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft Day 7 Nudge": {
+      "main": [
+        [
+          {
+            "node": "Dispatch Client Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft Day 14 Firm": {
+      "main": [
+        [
+          {
+            "node": "Dispatch Client Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dispatch Client Email": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack Admin",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flag Day 30 Human Alert": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack Admin",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

@@ -1,0 +1,154 @@
+{
+  "name": "Content Batch Queue Drain",
+  "active": false,
+  "nodes": [
+    {
+      "id": "6d8e0e64-3333-4333-8333-000000000001",
+      "name": "Every 30 Min Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [200, 300],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "6d8e0e64-3333-4333-8333-000000000002",
+      "name": "Fetch Batch Queue Items",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [420, 300],
+      "parameters": {
+        "url": "YOUR_REVIEW_GATE_WEBHOOK_URL",
+        "method": "GET",
+        "sendQuery": true,
+        "queryParametersUi": {
+          "parameter": [
+            {
+              "name": "status",
+              "value": "pending_generation"
+            },
+            {
+              "name": "limit",
+              "value": "5"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "6d8e0e64-3333-4333-8333-000000000003",
+      "name": "Split & Filter Up to 5 Items",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const items = $input.all();\nconst list = (items[0] && items[0].json && Array.isArray(items[0].json.items)) ? items[0].json.items : [];\n\nconst capped = list.slice(0, 5);\nreturn capped.map(entry => ({\n  json: {\n    itemId: entry.id || 'batch_' + Date.now().toString(36),\n    title: entry.title || 'Untitled Batch Item',\n    content: entry.content || entry.body || '',\n    author: entry.author || 'Batch Processor'\n  }\n}));"
+      }
+    },
+    {
+      "id": "6d8e0e64-3333-4333-8333-000000000004",
+      "name": "Drain into Main Repurposer",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [880, 300],
+      "parameters": {
+        "url": "http://localhost:5678/webhook/repurpose-content",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "title",
+              "value": "={{ $json.title }}"
+            },
+            {
+              "name": "content",
+              "value": "={{ $json.content }}"
+            },
+            {
+              "name": "author",
+              "value": "={{ $json.author }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "6d8e0e64-3333-4333-8333-000000000005",
+      "name": "Notify Slack Batch Finished",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1100, 300],
+      "parameters": {
+        "url": "YOUR_SLACK_WEBHOOK_URL",
+        "method": "POST",
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "text",
+              "value": "={{ `⚡ *Batch Queue Run Complete:* Processed ${$items().length} items into review drafts.` }}"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every 30 Min Schedule": {
+      "main": [
+        [
+          {
+            "node": "Fetch Batch Queue Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Batch Queue Items": {
+      "main": [
+        [
+          {
+            "node": "Split & Filter Up to 5 Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split & Filter Up to 5 Items": {
+      "main": [
+        [
+          {
+            "node": "Drain into Main Repurposer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Drain into Main Repurposer": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack Batch Finished",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

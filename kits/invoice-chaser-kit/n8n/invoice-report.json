@@ -1,0 +1,132 @@
+{
+  "name": "Invoice Monthly Overdue Report",
+  "active": false,
+  "nodes": [
+    {
+      "id": "4d8e0e64-2222-4222-8222-000000000001",
+      "name": "Monthly 1st Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [200, 300],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 1 * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "4d8e0e64-2222-4222-8222-000000000002",
+      "name": "Fetch All Open Invoices",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [420, 300],
+      "parameters": {
+        "url": "https://api.stripe.com/v1/invoices?status=open&limit=100",
+        "method": "GET",
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_STRIPE_RESTRICTED_KEY"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "4d8e0e64-2222-4222-8222-000000000003",
+      "name": "Aggregate Overdue Aging",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const items = $input.all();\nconst invoices = (items[0] && items[0].json && items[0].json.data) ? items[0].json.data : [];\nconst now = Math.floor(Date.now() / 1000);\n\nlet bucket1_30 = 0;\nlet bucket31_60 = 0;\nlet bucket60_plus = 0;\nlet totalOverdue = 0;\nlet count = 0;\n\nfor (const inv of invoices) {\n  if (!inv.due_date || inv.paid || inv.status !== 'open') continue;\n  const days = Math.floor((now - inv.due_date) / 86400);\n  if (days <= 0) continue;\n  \n  const amt = (inv.amount_due || 0) / 100;\n  totalOverdue += amt;\n  count++;\n  \n  if (days <= 30) bucket1_30 += amt;\n  else if (days <= 60) bucket31_60 += amt;\n  else bucket60_plus += amt;\n}\n\nreturn [{\n  json: {\n    month: new Date().toLocaleString('en-US', { month: 'long', year: 'numeric' }),\n    totalOverdueCount: count,\n    totalOverdueAmount: totalOverdue.toFixed(2),\n    bucket1_30: bucket1_30.toFixed(2),\n    bucket31_60: bucket31_60.toFixed(2),\n    bucket60_plus: bucket60_plus.toFixed(2)\n  }\n}];"
+      }
+    },
+    {
+      "id": "4d8e0e64-2222-4222-8222-000000000004",
+      "name": "Format Report Message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [860, 300],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const data = $input.item.json;\nconst text = `💰 *Monthly Accounts Receivable Aging Report — ${data.month}*\\n• *Total Overdue Invoices:* ${data.totalOverdueCount}\\n• *Total Outstanding Amount:* $${data.totalOverdueAmount}\\n\\n*Aging Breakdown:*\\n• 1–30 days: $${data.bucket1_30}\\n• 31–60 days: $${data.bucket31_60}\\n• 60+ days (Critical): $${data.bucket60_plus}`;\n\nreturn {\n  json: {\n    slackPayload: {\n      text: `Monthly Overdue Report: $${data.totalOverdueAmount} outstanding`,\n      attachments: [{\n        color: '#ff9900',\n        text: text,\n        footer: 'AutomateStack Monthly Chaser Report'\n      }]\n    }\n  }\n};"
+      }
+    },
+    {
+      "id": "4d8e0e64-2222-4222-8222-000000000005",
+      "name": "Send Report Slack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1080, 300],
+      "parameters": {
+        "url": "YOUR_SLACK_WEBHOOK_URL",
+        "method": "POST",
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "payload",
+              "value": "={{ JSON.stringify($json.slackPayload) }}"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Monthly 1st Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch All Open Invoices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch All Open Invoices": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Overdue Aging",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate Overdue Aging": {
+      "main": [
+        [
+          {
+            "node": "Format Report Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Report Message": {
+      "main": [
+        [
+          {
+            "node": "Send Report Slack",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

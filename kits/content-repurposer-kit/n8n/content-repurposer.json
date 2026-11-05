@@ -1,0 +1,298 @@
+{
+  "name": "Content Repurposer",
+  "active": false,
+  "nodes": [
+    {
+      "id": "5d8e0e64-3333-4333-8333-000000000001",
+      "name": "Webhook Repurpose Request",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [200, 300],
+      "parameters": {
+        "path": "repurpose-content",
+        "httpMethod": "POST",
+        "responseMode": "responseNode"
+      }
+    },
+    {
+      "id": "5d8e0e64-3333-4333-8333-000000000002",
+      "name": "Validate & Clean Text",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 300],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const item = $input.item.json;\nconst body = item.body || item;\nconst title = (body.title || 'Untitled Post').trim();\nconst content = (body.content || body.markdown || body.text || '').trim();\nconst author = (body.author || 'Author').trim();\n\nif (!content || content.length < 150) {\n  throw new Error('Content too short to repurpose. Provide at least 150 characters.');\n}\n\nreturn {\n  json: {\n    contentId: 'art_' + Date.now().toString(36),\n    title,\n    content,\n    author,\n    submittedAt: new Date().toISOString()\n  }\n};"
+      }
+    },
+    {
+      "id": "5d8e0e64-3333-4333-8333-000000000003",
+      "name": "Generate X Thread",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [720, 160],
+      "parameters": {
+        "url": "https://api.openai.com/v1/chat/completions",
+        "method": "POST",
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_OPENAI_OR_LLM_API_KEY"
+            }
+          ]
+        },
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "model",
+              "value": "gpt-4o-mini"
+            },
+            {
+              "name": "messages",
+              "value": "={{ [{\"role\":\"system\",\"content\":\"You are an expert X/Twitter thread creator. Transform the article into a punchy 5-7 tweet thread. RULES: 1. Strict factual loyalty: never invent metrics, numbers, or quotes not present in source. 2. Tweet 1 is a curiosity hook. Tweet 2-6 unpack one core insight each. Last tweet is a takeaway and bookmark CTA. Output plain markdown with numbered tweets.\"},{\"role\":\"user\",\"content\": $json.content}] }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "5d8e0e64-3333-4333-8333-000000000004",
+      "name": "Generate LinkedIn Carousel",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [720, 300],
+      "parameters": {
+        "url": "https://api.openai.com/v1/chat/completions",
+        "method": "POST",
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_OPENAI_OR_LLM_API_KEY"
+            }
+          ]
+        },
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "model",
+              "value": "gpt-4o-mini"
+            },
+            {
+              "name": "messages",
+              "value": "={{ [{\"role\":\"system\",\"content\":\"You are a B2B LinkedIn creator. Convert the source text into an 8-slide PDF carousel script. RULES: Do not invent facts or metrics. Format each slide clearly: Slide 1: Bold title & subtitle. Slides 2-7: One single actionable insight per slide (max 40 words). Slide 8: Summary & question to trigger comments.\"},{\"role\":\"user\",\"content\": $json.content}] }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "5d8e0e64-3333-4333-8333-000000000005",
+      "name": "Generate Newsletter",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [720, 440],
+      "parameters": {
+        "url": "https://api.openai.com/v1/chat/completions",
+        "method": "POST",
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_OPENAI_OR_LLM_API_KEY"
+            }
+          ]
+        },
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "model",
+              "value": "gpt-4o-mini"
+            },
+            {
+              "name": "messages",
+              "value": "={{ [{\"role\":\"system\",\"content\":\"You are an executive newsletter editor. Create a 3-minute read summary. Structure: 1. Why it matters (2 sentences). 2. Key takeaways (3 bullets). 3. Actionable framework. Strictly rely only on facts in the article.\"},{\"role\":\"user\",\"content\": $json.content}] }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "5d8e0e64-3333-4333-8333-000000000006",
+      "name": "Consolidate Review Assets",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1020, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const initial = $('Validate & Clean Text').first().json;\nconst threadRes = $('Generate X Thread').first().json;\nconst carouselRes = $('Generate LinkedIn Carousel').first().json;\nconst newsletterRes = $('Generate Newsletter').first().json;\n\nconst threadText = (threadRes.choices && threadRes.choices[0] && threadRes.choices[0].message) ? threadRes.choices[0].message.content : 'Thread generation error';\nconst carouselText = (carouselRes.choices && carouselRes.choices[0] && carouselRes.choices[0].message) ? carouselRes.choices[0].message.content : 'Carousel generation error';\nconst newsletterText = (newsletterRes.choices && newsletterRes.choices[0] && newsletterRes.choices[0].message) ? newsletterRes.choices[0].message.content : 'Newsletter generation error';\n\nreturn [{\n  json: {\n    contentId: initial.contentId,\n    title: initial.title,\n    author: initial.author,\n    status: 'NEEDS_HUMAN_REVIEW',\n    assets: {\n      twitterThread: threadText,\n      linkedInCarousel: carouselText,\n      newsletter: newsletterText\n    }\n  }\n}];"
+      }
+    },
+    {
+      "id": "5d8e0e64-3333-4333-8333-000000000007",
+      "name": "Push to Review Gate",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1260, 300],
+      "parameters": {
+        "url": "YOUR_REVIEW_GATE_WEBHOOK_URL",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "contentId",
+              "value": "={{ $json.contentId }}"
+            },
+            {
+              "name": "title",
+              "value": "={{ $json.title }}"
+            },
+            {
+              "name": "status",
+              "value": "={{ $json.status }}"
+            },
+            {
+              "name": "assets",
+              "value": "={{ JSON.stringify($json.assets) }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "5d8e0e64-3333-4333-8333-000000000008",
+      "name": "Alert Slack Reviewer",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1480, 300],
+      "parameters": {
+        "url": "YOUR_SLACK_WEBHOOK_URL",
+        "method": "POST",
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "text",
+              "value": "={{ `✍️ *New Assets Ready for Review:* \"${$json.title}\"\\n3 assets generated (X Thread, Carousel, Newsletter). Review gate holds publication pending human approval.` }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "5d8e0e64-3333-4333-8333-000000000009",
+      "name": "Respond With Draft ID",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1700, 300],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'queued_for_review', contentId: $json.contentId, title: $json.title }) }}"
+      }
+    }
+  ],
+  "connections": {
+    "Webhook Repurpose Request": {
+      "main": [
+        [
+          {
+            "node": "Validate & Clean Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Clean Text": {
+      "main": [
+        [
+          {
+            "node": "Generate X Thread",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Generate LinkedIn Carousel",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Generate Newsletter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate X Thread": {
+      "main": [
+        [
+          {
+            "node": "Consolidate Review Assets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate LinkedIn Carousel": {
+      "main": [
+        [
+          {
+            "node": "Consolidate Review Assets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Newsletter": {
+      "main": [
+        [
+          {
+            "node": "Consolidate Review Assets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Consolidate Review Assets": {
+      "main": [
+        [
+          {
+            "node": "Push to Review Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Push to Review Gate": {
+      "main": [
+        [
+          {
+            "node": "Alert Slack Reviewer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Alert Slack Reviewer": {
+      "main": [
+        [
+          {
+            "node": "Respond With Draft ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

@@ -1,0 +1,117 @@
+{
+  "brand": "AutomateStack",
+  "tagline": "Production-ready AI automation kits for people who ship alone.",
+  "subhead": "Buy once. Import. Ship the same afternoon. No account, no subscription, no support queue.",
+  "year": 2026,
+  "products": [
+    {
+      "slug": "lead-intake-automation",
+      "title": "Lead Intake Automation Kit",
+      "checkout": "https://juexing.gumroad.com/l/lead-intake",
+      "subtitle": "Turn form fills into qualified pipeline while you sleep.",
+      "price": 39,
+      "bullets": [
+        "2 importable n8n workflows: intake, plus a daily rollup",
+        "Score leads 0-100 on buying signals before they hit your CRM",
+        "Slack alert on arrival; hot leads get a different color",
+        "Works without a database, so there is nothing to provision"
+      ],
+      "inside": [
+        "n8n/lead-intake.json — main workflow, 10 nodes",
+        "n8n/lead-intake-digest.json — daily 09:00 rollup",
+        "make/recipe.md — node-by-node build steps for Make",
+        "docs/SETUP.md — config table plus a copy-paste test command",
+        "docs/ROLLBACK.md — undo everything in 5 minutes"
+      ],
+      "note": "Four field replacements to go live. No code editing."
+    },
+    {
+      "slug": "invoice-chaser-kit",
+      "title": "Invoice Chaser Kit",
+      "checkout": "https://juexing.gumroad.com/l/invoice-chaser",
+      "subtitle": "Stop chasing late payments by hand.",
+      "price": 29,
+      "bullets": [
+        "2 importable n8n workflows: reminder ladder, plus a monthly report",
+        "Four tone stages — day 3, 7, 14, 30 — and nothing in between",
+        "Read-only Stripe key setup, documented step by step",
+        "Skipped entirely once an invoice is paid"
+      ],
+      "inside": [
+        "n8n/invoice-chaser.json — daily scan and send",
+        "n8n/invoice-report.json — monthly overdue breakdown",
+        "make/recipe.md — node-by-node build steps for Make",
+        "docs/SETUP.md — restricted-key walkthrough",
+        "docs/ROLLBACK.md — undo everything in 5 minutes"
+      ],
+      "note": "The 30-day stage still needs your judgment. That is by design."
+    },
+    {
+      "slug": "content-repurposer-kit",
+      "title": "Content Repurposer Kit",
+      "checkout": "https://juexing.gumroad.com/l/content-repurposer",
+      "subtitle": "One long post becomes twelve platform-native assets.",
+      "price": 34,
+      "bullets": [
+        "2 importable n8n workflows: on-demand, plus a batch queue drain",
+        "Three standalone prompts: X thread, LinkedIn carousel, newsletter",
+        "Every prompt forbids inventing facts, numbers, or quotes",
+        "Review gate built in — nothing publishes without a human"
+      ],
+      "inside": [
+        "n8n/content-repurposer.json — webhook, 3 parallel assets",
+        "n8n/content-batch.json — every 30 minutes, 5 items",
+        "prompts/thread.md, carousel.md, newsletter.md — reusable alone",
+        "make/recipe.md — node-by-node build steps for Make",
+        "docs/SETUP.md and docs/ROLLBACK.md"
+      ],
+      "note": "About $0.002 per article in API calls."
+    }
+  ],
+  "inside_common": [
+    "Nothing here needs a database, a server, or a paid n8n tier.",
+    "Every workflow ships inactive. You read the config table before anything runs.",
+    "Every kit includes a rollback guide, because you will want one eventually.",
+    "Twelve months of workflow fixes included. Platform API changes are documented."
+  ],
+  "steps": [
+    [
+      "Import",
+      "n8n menu, Import from File. The workflow lands inactive."
+    ],
+    [
+      "Replace",
+      "Two or three placeholder URLs and keys. The setup doc lists every one."
+    ],
+    [
+      "Test",
+      "One copy-paste curl command. You see the result before it nears a customer."
+    ],
+    [
+      "Activate",
+      "Flip the switch. The first execution waits in the Executions panel."
+    ]
+  ],
+  "faq": [
+    [
+      "Do I need to know how to code?",
+      "No. You replace strings in a configuration panel. The only code is already written inside the workflow nodes, and you can read it — it is commented."
+    ],
+    [
+      "Will this work on the free n8n tier?",
+      "Yes. Nothing here depends on paid features, external queues, or a database."
+    ],
+    [
+      "What if a platform changes its API and a workflow breaks?",
+      "Within twelve months of purchase, send me the error and I ship a fix. I do not promise zero breakage — I promise the fix is free."
+    ],
+    [
+      "Is there a refund?",
+      "The checkout provider's standard refund policy applies. If you cannot import the file at all, tell me and I fix it before you ask for money back."
+    ],
+    [
+      "Why is there no auto-publish step in the content kit?",
+      "Language models can write; they cannot vouch for facts. The review gate is the product, not an unfinished feature."
+    ]
+  ]
+}

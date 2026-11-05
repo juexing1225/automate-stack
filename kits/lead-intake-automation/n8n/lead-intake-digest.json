@@ -1,0 +1,137 @@
+{
+  "name": "Lead Intake Daily Digest",
+  "active": false,
+  "nodes": [
+    {
+      "id": "2d8e0e64-1111-4111-8111-000000000001",
+      "name": "Daily 09:00 Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [200, 300],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * *"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "2d8e0e64-1111-4111-8111-000000000002",
+      "name": "Fetch Recent Leads",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [420, 300],
+      "parameters": {
+        "url": "YOUR_CRM_OR_SHEET_WEBHOOK_URL",
+        "method": "GET",
+        "sendQuery": true,
+        "queryParametersUi": {
+          "parameter": [
+            {
+              "name": "period",
+              "value": "last_24h"
+            },
+            {
+              "name": "adminEmail",
+              "value": "YOUR_NOTIFICATION_EMAIL"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "2d8e0e64-1111-4111-8111-000000000003",
+      "name": "Aggregate Digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const items = $input.all();\nconst leads = (items[0] && items[0].json && Array.isArray(items[0].json.leads)) ? items[0].json.leads : [];\n\nconst total = leads.length;\nconst hotLeads = leads.filter(l => (l.score || l.qualificationScore || 0) >= 70);\nconst avgScore = total > 0 ? Math.round(leads.reduce((acc, cur) => acc + (cur.score || cur.qualificationScore || 0), 0) / total) : 0;\n\nreturn [{\n  json: {\n    date: new Date().toISOString().split('T')[0],\n    totalCount: total,\n    hotCount: hotLeads.length,\n    averageScore: avgScore,\n    hotLeadsSummary: hotLeads.slice(0, 5).map(l => `${l.name} (${l.company || l.email}) - Score: ${l.score || l.qualificationScore}`)\n  }\n}];"
+      }
+    },
+    {
+      "id": "2d8e0e64-1111-4111-8111-000000000004",
+      "name": "Format Slack Digest",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [860, 300],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const data = $input.item.json;\nconst hotList = data.hotLeadsSummary.length > 0 ? data.hotLeadsSummary.join('\\n• ') : 'None in past 24h';\nconst text = `📊 *Daily Lead Rollup — ${data.date}*\\n• *Total Inquiries:* ${data.totalCount}\\n• *🔥 Hot Leads:* ${data.hotCount}\\n• *Average Score:* ${data.averageScore}/100\\n\\n*Top Prospects:*\\n• ${hotList}`;\n\nreturn {\n  json: {\n    slackPayload: {\n      text: `Daily Lead Rollup: ${data.totalCount} leads received (${data.hotCount} hot)`,\n      attachments: [{\n        color: '#36a64f',\n        text: text,\n        footer: 'AutomateStack Daily Digest'\n      }]\n    }\n  }\n};"
+      }
+    },
+    {
+      "id": "2d8e0e64-1111-4111-8111-000000000005",
+      "name": "Send Slack Digest",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1080, 300],
+      "parameters": {
+        "url": "YOUR_SLACK_WEBHOOK_URL",
+        "method": "POST",
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "payload",
+              "value": "={{ JSON.stringify($json.slackPayload) }}"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Daily 09:00 Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch Recent Leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Recent Leads": {
+      "main": [
+        [
+          {
+            "node": "Aggregate Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate Digest": {
+      "main": [
+        [
+          {
+            "node": "Format Slack Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Slack Digest": {
+      "main": [
+        [
+          {
+            "node": "Send Slack Digest",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

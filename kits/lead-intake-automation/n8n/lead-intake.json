@@ -1,0 +1,280 @@
+{
+  "name": "Lead Intake Automation",
+  "active": false,
+  "nodes": [
+    {
+      "id": "1d8e0e64-1111-4111-8111-000000000001",
+      "name": "Webhook Intake",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [200, 300],
+      "parameters": {
+        "path": "lead-intake",
+        "httpMethod": "POST",
+        "responseMode": "responseNode"
+      }
+    },
+    {
+      "id": "1d8e0e64-1111-4111-8111-000000000002",
+      "name": "Validate Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 300],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const item = $input.item.json;\nconst body = item.body || item;\nconst email = (body.email || '').trim().toLowerCase();\nconst name = (body.name || 'Anonymous').trim();\nconst company = (body.company || '').trim();\nconst message = (body.message || body.notes || '').trim();\nconst budget = body.budget ? String(body.budget).trim() : '';\n\nif (!email || !email.includes('@')) {\n  throw new Error('Missing or invalid email address.');\n}\n\nreturn {\n  json: {\n    leadId: 'lead_' + Date.now().toString(36) + Math.random().toString(36).substr(2, 5),\n    timestamp: new Date().toISOString(),\n    name,\n    email,\n    company,\n    budget,\n    message\n  }\n};"
+      }
+    },
+    {
+      "id": "1d8e0e64-1111-4111-8111-000000000003",
+      "name": "Extract Domain Info",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 300],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const lead = $input.item.json;\nconst parts = lead.email.split('@');\nconst domain = parts[1] || '';\nconst freeProviders = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'icloud.com', '163.com', 'qq.com'];\nconst isCorporate = !freeProviders.includes(domain) && domain.includes('.');\n\nreturn {\n  json: {\n    ...lead,\n    domain,\n    isCorporateDomain: isCorporate\n  }\n};"
+      }
+    },
+    {
+      "id": "1d8e0e64-1111-4111-8111-000000000004",
+      "name": "Score Lead Intent",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [860, 300],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const lead = $input.item.json;\nlet score = 20; // baseline for valid submission\nconst breakdown = [];\n\n// 1. Corporate Domain signal (+30)\nif (lead.isCorporateDomain) {\n  score += 30;\n  breakdown.push('corporate_domain (+30)');\n}\n\n// 2. Budget signals (+25)\nconst budgetStr = lead.budget.toLowerCase();\nif (budgetStr.includes('k') || budgetStr.includes('000') || budgetStr.includes('enterprise') || /\\$[1-9]/.test(budgetStr)) {\n  score += 25;\n  breakdown.push('high_budget_stated (+25)');\n} else if (lead.budget) {\n  score += 15;\n  breakdown.push('budget_stated (+15)');\n}\n\n// 3. Message depth & buying urgency (+25)\nconst msg = lead.message.toLowerCase();\nconst highIntentKeywords = ['demo', 'pricing', 'hire', 'contract', 'urgent', 'timeline', 'decision', 'team', 'integrate', 'migration'];\nlet keywordHits = 0;\nhighIntentKeywords.forEach(k => {\n  if (msg.includes(k)) keywordHits++;\n});\n\nif (keywordHits >= 2 || msg.length > 180) {\n  score += 25;\n  breakdown.push('high_intent_message (+25)');\n} else if (keywordHits === 1 || msg.length > 50) {\n  score += 15;\n  breakdown.push('moderate_intent_message (+15)');\n}\n\nscore = Math.min(100, Math.max(0, score));\nconst tier = score >= 70 ? 'HOT' : (score >= 45 ? 'WARM' : 'NURTURE');\n\nreturn {\n  json: {\n    ...lead,\n    qualificationScore: score,\n    qualificationTier: tier,\n    scoreBreakdown: breakdown\n  }\n};"
+      }
+    },
+    {
+      "id": "1d8e0e64-1111-4111-8111-000000000005",
+      "name": "Filter Hot vs Standard",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1080, 300],
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.qualificationScore }}",
+              "operation": "largerEqual",
+              "value2": 70
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "1d8e0e64-1111-4111-8111-000000000006",
+      "name": "Format Hot Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 200],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const lead = $input.item.json;\nconst text = `🔥 *HOT LEAD ALERT* (${lead.qualificationScore}/100)\\n*Name:* ${lead.name} (${lead.email})\\n*Company:* ${lead.company || lead.domain}\\n*Budget:* ${lead.budget || 'Not specified'}\\n*Message:* \"${lead.message}\"\\n*Signals:* ${lead.scoreBreakdown.join(', ')}`;\n\nreturn {\n  json: {\n    ...lead,\n    slackPayload: {\n      text: `🔥 Hot Lead: ${lead.name} (${lead.qualificationScore}/100)`,\n      attachments: [{\n        color: '#ff334b',\n        text: text,\n        footer: `AutomateStack Intake • ID: ${lead.leadId}`\n      }]\n    }\n  }\n};"
+      }
+    },
+    {
+      "id": "1d8e0e64-1111-4111-8111-000000000007",
+      "name": "Format Standard Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 420],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const lead = $input.item.json;\nconst text = `📋 *New Lead Submitted* (${lead.qualificationScore}/100 - ${lead.qualificationTier})\\n*Name:* ${lead.name} (${lead.email})\\n*Company:* ${lead.company || lead.domain}\\n*Budget:* ${lead.budget || 'N/A'}\\n*Message:* \"${lead.message}\"`;\n\nreturn {\n  json: {\n    ...lead,\n    slackPayload: {\n      text: `New Lead: ${lead.name} (${lead.qualificationScore}/100)`,\n      attachments: [{\n        color: '#2ea44f',\n        text: text,\n        footer: `AutomateStack Intake • ID: ${lead.leadId}`\n      }]\n    }\n  }\n};"
+      }
+    },
+    {
+      "id": "1d8e0e64-1111-4111-8111-000000000008",
+      "name": "Send Slack Alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1560, 300],
+      "parameters": {
+        "url": "YOUR_SLACK_WEBHOOK_URL",
+        "method": "POST",
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "payload",
+              "value": "={{ JSON.stringify($json.slackPayload) }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "1d8e0e64-1111-4111-8111-000000000009",
+      "name": "Forward to CRM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1780, 300],
+      "parameters": {
+        "url": "YOUR_CRM_OR_SHEET_WEBHOOK_URL",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "leadId",
+              "value": "={{ $json.leadId }}"
+            },
+            {
+              "name": "name",
+              "value": "={{ $json.name }}"
+            },
+            {
+              "name": "email",
+              "value": "={{ $json.email }}"
+            },
+            {
+              "name": "company",
+              "value": "={{ $json.company }}"
+            },
+            {
+              "name": "score",
+              "value": "={{ $json.qualificationScore }}"
+            },
+            {
+              "name": "tier",
+              "value": "={{ $json.qualificationTier }}"
+            },
+            {
+              "name": "message",
+              "value": "={{ $json.message }}"
+            },
+            {
+              "name": "notifyEmail",
+              "value": "YOUR_NOTIFICATION_EMAIL"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "1d8e0e64-1111-4111-8111-000000000010",
+      "name": "Webhook Response",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2000, 300],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'success', leadId: $json.leadId, qualificationTier: $json.qualificationTier }) }}"
+      }
+    }
+  ],
+  "connections": {
+    "Webhook Intake": {
+      "main": [
+        [
+          {
+            "node": "Validate Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Payload": {
+      "main": [
+        [
+          {
+            "node": "Extract Domain Info",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Domain Info": {
+      "main": [
+        [
+          {
+            "node": "Score Lead Intent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score Lead Intent": {
+      "main": [
+        [
+          {
+            "node": "Filter Hot vs Standard",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Hot vs Standard": {
+      "main": [
+        [
+          {
+            "node": "Format Hot Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Standard Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Hot Alert": {
+      "main": [
+        [
+          {
+            "node": "Send Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Standard Alert": {
+      "main": [
+        [
+          {
+            "node": "Send Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Slack Alert": {
+      "main": [
+        [
+          {
+            "node": "Forward to CRM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Forward to CRM": {
+      "main": [
+        [
+          {
+            "node": "Webhook Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
