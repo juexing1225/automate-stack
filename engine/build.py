@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-AutomateStack Storefront Generator
-Standard library only. Builds dist/index.html, dist/sitemap.xml, dist/robots.txt, dist/products.json
+AutomateStack Storefront & Product SEO Page Generator
+Standard library only. Builds dist/index.html, dist/p/*.html, dist/sitemap.xml, dist/robots.txt, dist/products.json
 from products.json catalog.
 """
 
@@ -31,7 +31,6 @@ def render_html(catalog):
     steps = catalog.get("steps", [])
     faqs = catalog.get("faq", [])
 
-    # Build Product Cards
     cards_html = []
     ld_products = []
     for p in products:
@@ -49,11 +48,13 @@ def render_html(catalog):
         else:
             cta_button = '<a class="buy ghost" href="#checkout">Available soon</a>'
 
+        details_link = f'<a class="plain muted" style="margin-left:14px;font-size:14px" href="p/{slug}.html">Details &rarr;</a>'
+
         card = f'''<div class="card">
 <h3>{title} <span class="price">${price}</span></h3>
 <p>{subtitle}</p>
 <ul>{bullets_li}</ul>
-{cta_button}
+{cta_button} {details_link}
 <p class="muted" style="margin-top:12px">{note}</p>
 </div>'''
         cards_html.append(card)
@@ -165,10 +166,109 @@ Built and maintained by an automated pipeline.</footer>
 <script type="application/ld+json">{ld_json}</script></div></body></html>
 '''
 
+def render_product_page(product, catalog):
+    brand = catalog.get("brand", "AutomateStack")
+    title = html.escape(product.get("title", ""))
+    subtitle = html.escape(product.get("subtitle", ""))
+    price = product.get("price", 0)
+    checkout = product.get("checkout", "")
+    note = html.escape(product.get("note", ""))
+    slug = product.get("slug", "")
+    bullets = product.get("bullets", [])
+    inside = product.get("inside", [])
+
+    bullets_li = "".join(f"<li>{html.escape(b)}</li>" for b in bullets)
+    inside_codes = "".join(f"<code>{html.escape(item)}</code>" for item in inside)
+
+    if checkout:
+        cta_button = f'<a class="buy" href="{html.escape(checkout)}">Buy now for ${price}</a>'
+    else:
+        cta_button = '<a class="buy ghost" href="../#checkout">Available soon</a>'
+
+    ld_json = json.dumps({
+        "@context": "https://schema.org",
+        "@type": "Product",
+        "name": product.get("title", ""),
+        "description": product.get("subtitle", ""),
+        "url": f"{BASE_URL}/p/{slug}.html",
+        "offers": {
+            "@type": "Offer",
+            "price": str(price),
+            "priceCurrency": "USD",
+            "availability": "https://schema.org/InStock"
+        }
+    }, ensure_ascii=False)
+
+    return f'''<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{title} — {html.escape(brand)}</title>
+<meta name="description" content="{subtitle}">
+<link rel="canonical" href="{BASE_URL}/p/{slug}.html">
+<meta property="og:type" content="product">
+<meta property="og:title" content="{title}">
+<meta property="og:description" content="{subtitle}">
+<meta property="og:url" content="{BASE_URL}/p/{slug}.html">
+<style>
+:root{{--bg:#0b0b0f;--fg:#f4f4f5;--muted:#9a9aa5;--line:#26262e;--acc:#c8ff3d}}
+*{{box-sizing:border-box}}
+body{{margin:0;background:var(--bg);color:var(--fg);
+font:16px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+-webkit-font-smoothing:antialiased}}
+.wrap{{max-width:820px;margin:0 auto;padding:0 24px}}
+nav{{padding:32px 0 16px}}
+h1{{font-size:38px;line-height:1.15;margin:16px 0 12px;letter-spacing:-.025em}}
+p.lead{{color:var(--muted);font-size:18px;margin:0 0 28px}}
+.price{{color:var(--acc);font-weight:700;font-size:24px;margin-bottom:20px;display:inline-block}}
+.buy{{display:inline-block;background:var(--acc);color:#0b0b0f;
+font-weight:700;padding:14px 28px;border-radius:10px;text-decoration:none}}
+.card{{border:1px solid var(--line);border-radius:14px;padding:26px;margin:28px 0}}
+.inside{{border:1px solid var(--line);border-radius:14px;padding:22px 26px;margin:24px 0;background:#0e0e13}}
+.inside code{{display:block;font:13px/1.9 ui-monospace,SFMono-Regular,Menlo,monospace;color:#c7c7d1;padding:2px 0}}
+ul{{padding-left:20px;margin:14px 0 0}}
+li{{margin:7px 0;color:#d4d4d8;font-size:15px}}
+a.plain{{color:var(--acc);text-decoration:none}}
+a.plain:hover{{text-decoration:underline}}
+footer{{padding:48px 0;color:var(--muted);font-size:13px;border-top:1px solid var(--line);margin-top:56px}}
+</style></head>
+<body><div class="wrap">
+<nav><a class="plain" href="../">&larr; Back to all kits</a></nav>
+<h1>{title}</h1>
+<p class="lead">{subtitle}</p>
+<div class="price">${price}</div><br>
+{cta_button}
+
+<div class="card">
+<h2 style="margin-top:0;font-size:20px">Key Capabilities</h2>
+<ul>{bullets_li}</ul>
+<p class="muted" style="margin-top:16px">{note}</p>
+</div>
+
+<h2 style="font-size:20px">Included in this download</h2>
+<div class="inside">{inside_codes}</div>
+
+<h2>Delivery & Guarantee</h2>
+<ul>
+<li>Delivered instantly as an importable ZIP file upon purchase.</li>
+<li>Requires zero servers, databases, or paid subscriptions.</li>
+<li>Includes step-by-step <code>SETUP.md</code> and full <code>ROLLBACK.md</code>.</li>
+</ul>
+
+<footer>&copy; 2026 {html.escape(brand)}. Instant digital delivery via Gumroad.</footer>
+<script type="application/ld+json">{ld_json}</script>
+</div></body></html>
+'''
+
 def render_sitemap(catalog):
+    products = catalog.get("products", [])
+    urls = [f"<url><loc>{BASE_URL}/</loc></url>"]
+    for p in products:
+        slug = p.get("slug")
+        urls.append(f"<url><loc>{BASE_URL}/p/{slug}.html</loc></url>")
+    joined_urls = "\n  ".join(urls)
     return f'''<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
-  <url><loc>{BASE_URL}/</loc></url>
+  {joined_urls}
 </urlset>
 '''
 
@@ -181,34 +281,45 @@ Sitemap: {BASE_URL}/sitemap.xml
 def build():
     catalog = load_catalog()
     DIST_DIR.mkdir(parents=True, exist_ok=True)
+    dist_p = DIST_DIR / "p"
+    base_p = BASE_DIR / "p"
+    dist_p.mkdir(parents=True, exist_ok=True)
+    base_p.mkdir(parents=True, exist_ok=True)
 
     # 1. index.html
     html_content = render_html(catalog)
     with open(DIST_DIR / "index.html", "w", encoding="utf-8") as f:
         f.write(html_content)
-
-    # Also keep root index.html synchronized for root Pages deployment
     with open(BASE_DIR / "index.html", "w", encoding="utf-8") as f:
         f.write(html_content)
 
-    # 2. sitemap.xml
+    # 2. Individual Product Pages
+    for prod in catalog.get("products", []):
+        slug = prod.get("slug")
+        prod_html = render_product_page(prod, catalog)
+        with open(dist_p / f"{slug}.html", "w", encoding="utf-8") as f:
+            f.write(prod_html)
+        with open(base_p / f"{slug}.html", "w", encoding="utf-8") as f:
+            f.write(prod_html)
+
+    # 3. sitemap.xml
     sitemap_content = render_sitemap(catalog)
     with open(DIST_DIR / "sitemap.xml", "w", encoding="utf-8") as f:
         f.write(sitemap_content)
     with open(BASE_DIR / "sitemap.xml", "w", encoding="utf-8") as f:
         f.write(sitemap_content)
 
-    # 3. robots.txt
+    # 4. robots.txt
     robots_content = render_robots()
     with open(DIST_DIR / "robots.txt", "w", encoding="utf-8") as f:
         f.write(robots_content)
     with open(BASE_DIR / "robots.txt", "w", encoding="utf-8") as f:
         f.write(robots_content)
 
-    # 4. products.json
+    # 5. products.json
     shutil.copyfile(PRODUCTS_FILE, DIST_DIR / "products.json")
 
-    print(f"✓ Successfully built storefront in {DIST_DIR} and updated root static files.")
+    print(f"✓ Successfully built storefront and {len(catalog.get('products', []))} product pages.")
 
 if __name__ == "__main__":
     build()

@@ -1,0 +1,276 @@
+{
+  "name": "Support Triage & SLA Guardian",
+  "active": false,
+  "nodes": [
+    {
+      "id": "7d8e0e64-4444-4444-8444-000000000001",
+      "name": "Webhook Ticket Ingest",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [200, 300],
+      "parameters": {
+        "path": "support-ticket",
+        "httpMethod": "POST",
+        "responseMode": "responseNode"
+      }
+    },
+    {
+      "id": "7d8e0e64-4444-4444-8444-000000000002",
+      "name": "Normalize Ticket Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 300],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const item = $input.item.json;\nconst body = item.body || item;\nconst customerEmail = (body.email || body.customerEmail || '').trim().toLowerCase();\nconst subject = (body.subject || 'Support Request').trim();\nconst message = (body.message || body.ticketBody || '').trim();\nconst plan = (body.plan || body.tier || 'standard').toLowerCase();\n\nif (!customerEmail || !message) {\n  throw new Error('Invalid ticket: missing email or message.');\n}\n\nreturn {\n  json: {\n    ticketId: 'tkt_' + Date.now().toString(36),\n    customerEmail,\n    subject,\n    message,\n    plan,\n    isVIP: plan.includes('pro') || plan.includes('enterprise'),\n    createdAt: new Date().toISOString()\n  }\n};"
+      }
+    },
+    {
+      "id": "7d8e0e64-4444-4444-8444-000000000003",
+      "name": "Analyze Sentiment & Triage",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [660, 300],
+      "parameters": {
+        "url": "https://api.openai.com/v1/chat/completions",
+        "method": "POST",
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_OPENAI_OR_LLM_API_KEY"
+            }
+          ]
+        },
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "model",
+              "value": "gpt-4o-mini"
+            },
+            {
+              "name": "response_format",
+              "value": "={{ { type: 'json_object' } }}"
+            },
+            {
+              "name": "messages",
+              "value": "={{ [{\"role\":\"system\",\"content\":\"You are an enterprise support triage AI. Output JSON with: urgency (CRITICAL|HIGH|MEDIUM|LOW), sentiment (ANGRY|NEUTRAL|SATISFIED), category (BILLING|BUG|FEATURE|INQUIRY), and proposedDraft (an empathetic, concise preliminary response without making unauthorized refund/fix promises).\"},{\"role\":\"user\",\"content\": `Subject: ${$json.subject}\\nMessage: ${$json.message}`}] }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "7d8e0e64-4444-4444-8444-000000000004",
+      "name": "Extract Triage Output",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [900, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const original = $('Normalize Ticket Payload').first().json;\nconst aiRes = $('Analyze Sentiment & Triage').first().json;\n\nlet parsed = { urgency: 'MEDIUM', sentiment: 'NEUTRAL', category: 'INQUIRY', proposedDraft: '' };\ntry {\n  const rawContent = (aiRes.choices && aiRes.choices[0] && aiRes.choices[0].message) ? aiRes.choices[0].message.content : '{}';\n  parsed = { ...parsed, ...JSON.parse(rawContent) };\n} catch (e) {}\n\nconst isEscalation = parsed.urgency === 'CRITICAL' || parsed.sentiment === 'ANGRY' || (original.isVIP && parsed.urgency === 'HIGH');\n\nreturn [{\n  json: {\n    ...original,\n    ...parsed,\n    isEscalation\n  }\n}];"
+      }
+    },
+    {
+      "id": "7d8e0e64-4444-4444-8444-000000000005",
+      "name": "Route Escalation",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [1120, 300],
+      "parameters": {
+        "conditions": {
+          "boolean": [
+            {
+              "value1": "={{ $json.isEscalation }}",
+              "value2": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "7d8e0e64-4444-4444-8444-000000000006",
+      "name": "Format Critical Slack Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1360, 200],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const item = $input.item.json;\nconst text = `🚨 *URGENT SUPPORT TICKET ESCALATED*\\n• *Ticket ID:* ${item.ticketId}\\n• *Customer:* ${item.customerEmail} (${item.plan.toUpperCase()})\\n• *Urgency:* ${item.urgency} | *Sentiment:* ${item.sentiment}\\n• *Category:* ${item.category}\\n• *Subject:* ${item.subject}\\n\\n*Message:*\\n\"${item.message}\"\\n\\n*Suggested Draft:*\\n${item.proposedDraft}`;\n\nreturn {\n  json: {\n    ...item,\n    slackPayload: {\n      text: `🚨 Urgent Ticket: ${item.subject} (${item.customerEmail})`,\n      attachments: [{\n        color: '#d00000',\n        text: text\n      }]\n    }\n  }\n};"
+      }
+    },
+    {
+      "id": "7d8e0e64-4444-4444-8444-000000000007",
+      "name": "Format Standard Slack Notice",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1360, 420],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const item = $input.item.json;\nconst text = `📥 *New Support Ticket Logged* (${item.ticketId})\\n• *From:* ${item.customerEmail}\\n• *Category:* ${item.category} (Urgency: ${item.urgency})\\n• *Subject:* ${item.subject}`;\n\nreturn {\n  json: {\n    ...item,\n    slackPayload: {\n      text: `Support Ticket: ${item.subject}`,\n      attachments: [{\n        color: '#4361ee',\n        text: text\n      }]\n    }\n  }\n};"
+      }
+    },
+    {
+      "id": "7d8e0e64-4444-4444-8444-000000000008",
+      "name": "Send Slack Escalation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1600, 300],
+      "parameters": {
+        "url": "YOUR_SLACK_WEBHOOK_URL",
+        "method": "POST",
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "payload",
+              "value": "={{ JSON.stringify($json.slackPayload) }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "7d8e0e64-4444-4444-8444-000000000009",
+      "name": "Sync Ticket to CRM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1820, 300],
+      "parameters": {
+        "url": "YOUR_HELPDESK_OR_CRM_WEBHOOK_URL",
+        "method": "POST",
+        "sendBody": true,
+        "bodyParametersUi": {
+          "parameter": [
+            { "name": "ticketId", "value": "={{ $json.ticketId }}" },
+            { "name": "email", "value": "={{ $json.customerEmail }}" },
+            { "name": "urgency", "value": "={{ $json.urgency }}" },
+            { "name": "category", "value": "={{ $json.category }}" },
+            { "name": "draft", "value": "={{ $json.proposedDraft }}" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "7d8e0e64-4444-4444-8444-000000000010",
+      "name": "Respond to Ticket Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2040, 300],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'triaged', ticketId: $json.ticketId, urgency: $json.urgency, isEscalation: $json.isEscalation }) }}"
+      }
+    }
+  ],
+  "connections": {
+    "Webhook Ticket Ingest": {
+      "main": [
+        [
+          {
+            "node": "Normalize Ticket Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize Ticket Payload": {
+      "main": [
+        [
+          {
+            "node": "Analyze Sentiment & Triage",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze Sentiment & Triage": {
+      "main": [
+        [
+          {
+            "node": "Extract Triage Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Triage Output": {
+      "main": [
+        [
+          {
+            "node": "Route Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Escalation": {
+      "main": [
+        [
+          {
+            "node": "Format Critical Slack Alert",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Standard Slack Notice",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Critical Slack Alert": {
+      "main": [
+        [
+          {
+            "node": "Send Slack Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Standard Slack Notice": {
+      "main": [
+        [
+          {
+            "node": "Send Slack Escalation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Slack Escalation": {
+      "main": [
+        [
+          {
+            "node": "Sync Ticket to CRM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sync Ticket to CRM": {
+      "main": [
+        [
+          {
+            "node": "Respond to Ticket Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

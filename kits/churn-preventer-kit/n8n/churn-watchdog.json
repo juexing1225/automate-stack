@@ -1,0 +1,132 @@
+{
+  "name": "SaaS Churn Watchdog",
+  "active": false,
+  "nodes": [
+    {
+      "id": "9d8e0e64-5555-5555-8555-000000000001",
+      "name": "Weekly Monday Scan",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [200, 300],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * 1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "9d8e0e64-5555-5555-8555-000000000002",
+      "name": "Fetch Product Usage Telemetry",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [420, 300],
+      "parameters": {
+        "url": "https://api.mixpanel.com/export",
+        "method": "GET",
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_PRODUCT_ANALYTICS_API_KEY"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "9d8e0e64-5555-5555-8555-000000000003",
+      "name": "Evaluate Activity Drop",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const items = $input.all();\nconst accounts = (items[0] && items[0].json && Array.isArray(items[0].json.accounts)) ? items[0].json.accounts : [];\nconst atRisk = [];\n\nfor (const acc of accounts) {\n  const prev14 = acc.eventsPrev14Days || 0;\n  const last14 = acc.eventsLast14Days || 0;\n  const mrr = acc.mrr || 50;\n  \n  // Drop calculation: > 60% decline in active usage\n  if (prev14 > 10 && last14 < prev14 * 0.4) {\n    const dropPct = Math.round((1 - (last14 / prev14)) * 100);\n    atRisk.push({\n      accountId: acc.id,\n      accountName: acc.name,\n      ownerEmail: acc.email,\n      mrr,\n      prev14Events: prev14,\n      last14Events: last14,\n      dropPercentage: dropPct\n    });\n  }\n}\n\nreturn atRisk.map(a => ({ json: a }));"
+      }
+    },
+    {
+      "id": "9d8e0e64-5555-5555-8555-000000000004",
+      "name": "Format At-Risk Alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 300],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const a = $input.item.json;\nconst text = `⚠️ *CHURN RISK DETECTED: ${a.accountName}*\\n• *Owner:* ${a.ownerEmail}\\n• *Monthly Value (MRR):* $${a.mrr}\\n• *Usage Drop:* -${a.dropPercentage}% in past 14 days (${a.prev14Events} → ${a.last14Events} events)\\n\\n*Action:* Automated concierge check-in queued.`;\n\nreturn {\n  json: {\n    ...a,\n    slackPayload: {\n      text: `Churn Warning: ${a.accountName} (-${a.dropPercentage}%)`,\n      attachments: [{\n        color: '#ff9f1c',\n        text: text\n      }]\n    }\n  }\n};"
+      }
+    },
+    {
+      "id": "9d8e0e64-5555-5555-8555-000000000005",
+      "name": "Send Slack Churn Warning",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1100, 300],
+      "parameters": {
+        "url": "YOUR_SLACK_WEBHOOK_URL",
+        "method": "POST",
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "payload",
+              "value": "={{ JSON.stringify($json.slackPayload) }}"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Weekly Monday Scan": {
+      "main": [
+        [
+          {
+            "node": "Fetch Product Usage Telemetry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Product Usage Telemetry": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Activity Drop",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Activity Drop": {
+      "main": [
+        [
+          {
+            "node": "Format At-Risk Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format At-Risk Alert": {
+      "main": [
+        [
+          {
+            "node": "Send Slack Churn Warning",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

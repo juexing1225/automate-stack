@@ -1,0 +1,135 @@
+{
+  "name": "SaaS Churn Concierge Outreach",
+  "active": false,
+  "nodes": [
+    {
+      "id": "ad8e0e64-5555-5555-8555-000000000001",
+      "name": "Webhook Churn Ingest",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [200, 300],
+      "parameters": {
+        "path": "churn-intervention",
+        "httpMethod": "POST",
+        "responseMode": "responseNode"
+      }
+    },
+    {
+      "id": "ad8e0e64-5555-5555-8555-000000000002",
+      "name": "Draft Concierge Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 300],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const item = $input.item.json;\nconst body = item.body || item;\nconst recipient = body.ownerEmail || body.email || 'customer@example.com';\nconst name = body.accountName || 'there';\n\nconst subject = `Quick check-in from founder on your setup`;\nconst text = `Hi ${name},\\n\\nI noticed activity dipped on your workspace over the last couple of weeks. Usually that means either you ran into an unexpected friction point or our team missed something during setup.\\n\\nIf you hit a roadblock, reply directly to this email — I read every response and can hop on a 10-minute screenshare to get it sorted.\\n\\nBest,\\nFounder & Team`;\n\nreturn {\n  json: {\n    recipient,\n    subject,\n    text,\n    senderEmail: 'YOUR_SENDER_EMAIL',\n    adminEmail: 'YOUR_NOTIFICATION_EMAIL'\n  }\n};"
+      }
+    },
+    {
+      "id": "ad8e0e64-5555-5555-8555-000000000003",
+      "name": "Send Concierge Email",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [640, 300],
+      "parameters": {
+        "url": "https://api.resend.com/emails",
+        "method": "POST",
+        "headerParametersUi": {
+          "parameter": [
+            {
+              "name": "Authorization",
+              "value": "Bearer YOUR_PRODUCT_ANALYTICS_API_KEY"
+            }
+          ]
+        },
+        "bodyParametersUi": {
+          "parameter": [
+            { "name": "from", "value": "YOUR_SENDER_EMAIL" },
+            { "name": "to", "value": "={{ $json.recipient }}" },
+            { "name": "subject", "value": "={{ $json.subject }}" },
+            { "name": "text", "value": "={{ $json.text }}" }
+          ]
+        }
+      }
+    },
+    {
+      "id": "ad8e0e64-5555-5555-8555-000000000004",
+      "name": "Notify Slack Outreach Sent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [860, 300],
+      "parameters": {
+        "url": "YOUR_SLACK_WEBHOOK_URL",
+        "method": "POST",
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "text",
+              "value": "={{ `📬 *Concierge Check-in Sent* to ${$json.recipient} (Copy to: ${$json.adminEmail})` }}"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "ad8e0e64-5555-5555-8555-000000000005",
+      "name": "Respond With Status",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [1080, 300],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ status: 'sent', recipient: $json.recipient }) }}"
+      }
+    }
+  ],
+  "connections": {
+    "Webhook Churn Ingest": {
+      "main": [
+        [
+          {
+            "node": "Draft Concierge Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Draft Concierge Email": {
+      "main": [
+        [
+          {
+            "node": "Send Concierge Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Concierge Email": {
+      "main": [
+        [
+          {
+            "node": "Notify Slack Outreach Sent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Slack Outreach Sent": {
+      "main": [
+        [
+          {
+            "node": "Respond With Status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

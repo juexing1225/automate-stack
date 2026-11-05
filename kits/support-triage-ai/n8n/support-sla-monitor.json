@@ -1,0 +1,162 @@
+{
+  "name": "Support SLA Breach Monitor",
+  "active": false,
+  "nodes": [
+    {
+      "id": "8d8e0e64-4444-4444-8444-000000000001",
+      "name": "Every 15 Min Trigger",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1,
+      "position": [200, 300],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 15
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "8d8e0e64-4444-4444-8444-000000000002",
+      "name": "Fetch Open Tickets",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [420, 300],
+      "parameters": {
+        "url": "YOUR_HELPDESK_OR_CRM_WEBHOOK_URL",
+        "method": "GET",
+        "sendQuery": true,
+        "queryParametersUi": {
+          "parameter": [
+            {
+              "name": "status",
+              "value": "open_unanswered"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "8d8e0e64-4444-4444-8444-000000000003",
+      "name": "Calculate SLA Risk",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const items = $input.all();\nconst tickets = (items[0] && items[0].json && Array.isArray(items[0].json.tickets)) ? items[0].json.tickets : [];\nconst now = Date.now();\nconst atRisk = [];\n\nfor (const t of tickets) {\n  const created = new Date(t.createdAt).getTime();\n  const ageMins = Math.floor((now - created) / 60000);\n  \n  // SLA rule: Critical/VIP > 60m, Standard > 180m\n  const threshold = (t.urgency === 'CRITICAL' || t.isVIP) ? 60 : 180;\n  if (ageMins >= threshold) {\n    atRisk.push({ ...t, ageMins, threshold });\n  }\n}\n\nreturn [{\n  json: {\n    breachCount: atRisk.length,\n    breachedTickets: atRisk\n  }\n}];"
+      }
+    },
+    {
+      "id": "8d8e0e64-4444-4444-8444-000000000004",
+      "name": "Filter If Breached",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [860, 300],
+      "parameters": {
+        "conditions": {
+          "number": [
+            {
+              "value1": "={{ $json.breachCount }}",
+              "operation": "larger",
+              "value2": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "8d8e0e64-4444-4444-8444-000000000005",
+      "name": "Format SLA Warning",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 200],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const data = $input.item.json;\nconst list = data.breachedTickets.map(t => `• *[${t.urgency}]* ${t.ticketId} (${t.email}): Waiting ${t.ageMins} mins (Limit: ${t.threshold}m)`).join('\\n');\n\nreturn {\n  json: {\n    slackPayload: {\n      text: `⚠️ SLA Alert: ${data.breachCount} tickets currently breaching response target!`,\n      attachments: [{\n        color: '#ffaa00',\n        text: `*Attention:* The following tickets need immediate review:\\n\\n${list}`\n      }]\n    }\n  }\n};"
+      }
+    },
+    {
+      "id": "8d8e0e64-4444-4444-8444-000000000006",
+      "name": "Send SLA Slack Warning",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 3,
+      "position": [1320, 200],
+      "parameters": {
+        "url": "YOUR_SLACK_WEBHOOK_URL",
+        "method": "POST",
+        "bodyParametersUi": {
+          "parameter": [
+            {
+              "name": "payload",
+              "value": "={{ JSON.stringify($json.slackPayload) }}"
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every 15 Min Trigger": {
+      "main": [
+        [
+          {
+            "node": "Fetch Open Tickets",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Open Tickets": {
+      "main": [
+        [
+          {
+            "node": "Calculate SLA Risk",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate SLA Risk": {
+      "main": [
+        [
+          {
+            "node": "Filter If Breached",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter If Breached": {
+      "main": [
+        [
+          {
+            "node": "Format SLA Warning",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format SLA Warning": {
+      "main": [
+        [
+          {
+            "node": "Send SLA Slack Warning",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

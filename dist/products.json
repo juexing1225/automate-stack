@@ -66,6 +66,47 @@
         "docs/SETUP.md and docs/ROLLBACK.md"
       ],
       "note": "About $0.002 per article in API calls."
+    },
+    {
+      "slug": "support-triage-ai",
+      "title": "Support Triage & SLA Guardian",
+      "checkout": "https://juexing.gumroad.com/l/support-triage",
+      "subtitle": "Categorize, draft, and escalate customer tickets instantly.",
+      "price": 39,
+      "bullets": [
+        "2 importable n8n workflows: real-time webhook triage plus SLA breach monitor",
+        "Detects customer sentiment, urgency level, and VIP account flags",
+        "Drafts contextual empathetic replies using your knowledge docs",
+        "Alerts Slack immediately on angry users or impending SLA breach"
+      ],
+      "inside": [
+        "n8n/support-triage.json — ticket classifier and draft generator",
+        "n8n/support-sla-monitor.json — 15-minute SLA breach watchdog",
+        "prompts/triage-system.md — empathy & classification system prompt",
+        "make/recipe.md — node-by-node build steps for Make",
+        "docs/SETUP.md and docs/ROLLBACK.md"
+      ],
+      "note": "Prevents VIP customer escalation while keeping human agents in control."
+    },
+    {
+      "slug": "churn-preventer-kit",
+      "title": "SaaS Churn Preventer & Usage Watchdog",
+      "checkout": "https://juexing.gumroad.com/l/churn-preventer",
+      "subtitle": "Detect account drop-offs and intervene before users cancel.",
+      "price": 49,
+      "bullets": [
+        "2 importable n8n workflows: weekly usage decline scan plus win-back trigger",
+        "Calculates 14-day vs 30-day activity delta to spot at-risk accounts",
+        "Dispatches personalized founder-check-in email drafts",
+        "Pings team channel with account health score and friction points"
+      ],
+      "inside": [
+        "n8n/churn-watchdog.json — weekly telemetry and health score evaluator",
+        "n8n/churn-outreach.json — automated concierge check-in dispatcher",
+        "make/recipe.md — node-by-node build steps for Make",
+        "docs/SETUP.md and docs/ROLLBACK.md"
+      ],
+      "note": "Reduces logo churn with zero cold automated spam."
     }
   ],
   "inside_common": [
