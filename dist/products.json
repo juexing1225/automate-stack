@@ -70,7 +70,7 @@
     {
       "slug": "support-triage-ai",
       "title": "Support Triage & SLA Guardian",
-      "checkout": "https://juexing.gumroad.com/l/support-triage",
+      "checkout": "",
       "subtitle": "Categorize, draft, and escalate customer tickets instantly.",
       "price": 39,
       "bullets": [
@@ -91,7 +91,7 @@
     {
       "slug": "churn-preventer-kit",
       "title": "SaaS Churn Preventer & Usage Watchdog",
-      "checkout": "https://juexing.gumroad.com/l/churn-preventer",
+      "checkout": "",
       "subtitle": "Detect account drop-offs and intervene before users cancel.",
       "price": 49,
       "bullets": [
