@@ -481,6 +481,14 @@ class TestMisc(RepoFixture):
         self.assertIn("Test issue 1", text)
         self.assertIn("不修改 `docs/ARCHITECTURE.md`", text)
 
+    def test_clear_member_lock(self):
+        lock = collab.locks_dir(self.repo) / "alice.json"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text("{}", encoding="utf-8")
+        self.assertTrue(lock.exists())
+        collab.clear_member_lock(self.repo, "alice")
+        self.assertFalse(lock.exists())
+
 
 class TestFlow(RepoFixture):
     def test_submit_then_independent_review(self):
@@ -750,6 +758,34 @@ class TestFlow(RepoFixture):
         self.assertIn("proxy=true", comments[-1]["stdin"])
         self.assertIn("代录声明", comments[-1]["stdin"])
 
+    def test_gh_queries_include_time_fields(self):
+        issue = self.issue(number=1, labels=["status:ready"])
+        issue["createdAt"] = "2026-11-26T10:00:00Z"
+        self.write_state({"issues": {"1": issue}, "pr": None, "prs": []})
+        run_tool(self.repo, "next", "--member", "alice", "--json", env=self.env)
+        run_tool(self.repo, "claim", "1", "--member", "alice", env=self.env)
+        calls = self.read_log()
+
+        def json_fields(args):
+            return args[args.index("--json") + 1] if "--json" in args else ""
+
+        issue_lists = [c for c in calls if c["args"][:2] == ["issue", "list"]]
+        pr_lists = [c for c in calls if c["args"][:2] == ["pr", "list"]]
+        issue_views = [
+            c for c in calls
+            if c["args"][:2] == ["issue", "view"] and "--json" in c["args"]
+        ]
+        self.assertTrue(issue_lists)
+        self.assertTrue(pr_lists)
+        self.assertTrue(issue_views)
+        # 只检查给阶梯判定喂数据的查询（带 body/state 的那批）；
+        # member_wip 只取 number,labels，不需要时间字段。
+        stage_lists = [c for c in issue_lists if "body" in json_fields(c["args"])]
+        self.assertTrue(stage_lists)
+        self.assertTrue(all("createdAt" in json_fields(c["args"]) for c in stage_lists))
+        self.assertTrue(all("createdAt" in json_fields(c["args"]) for c in pr_lists))
+        self.assertTrue(any("createdAt" in json_fields(c["args"]) for c in issue_views))
+
 
 class TestV23(RepoFixture):
     def test_review_rejects_same_family(self):
@@ -1009,6 +1045,15 @@ class TestV26(unittest.TestCase):
         self.assertTrue(collab.check_stage_eligibility(hard, "gpt", cfg, now=now, role="dev"))
         self.assertFalse(collab.check_stage_eligibility(hard, "qianwen", cfg, now=now, role="dev"))
 
+    def test_pool_unlock_is_cumulative(self):
+        cfg = v26_cfg()
+        now = collab.datetime(2026, 11, 26, 17, 0, 0, tzinfo=collab.timezone.utc)
+        stale = (now - collab.timedelta(minutes=20)).isoformat()
+        item = {"labels": [{"name": "tier:basic"}], "createdAt": stale}
+        # 满 15 分钟后 @abundant 补位，但 @free 不能因此失去资格
+        self.assertTrue(collab.check_stage_eligibility(item, "qianwen", cfg, now=now, role="dev"))
+        self.assertTrue(collab.check_stage_eligibility(item, "gemini", cfg, now=now, role="dev"))
+
     def test_prefer_override(self):
         cfg = v26_cfg()
         now = collab.datetime(2026, 11, 26, 17, 0, 0, tzinfo=collab.timezone.utc)
@@ -1046,6 +1091,18 @@ class TestV26(unittest.TestCase):
         basic = {"labels": [{"name": "tier:basic"}], "createdAt": now.isoformat(), "body": prefer_body}
         self.assertTrue(collab.check_stage_eligibility(basic, "baizhi", cfg, now=now, role="dev"))
 
+    def test_template_dispatch_section_parses(self):
+        # 工单模板小节标题须为「## 派单偏好」，且注释被 strip 后点将生效
+        cfg = v26_cfg()
+        now = collab.datetime(2026, 11, 26, 17, 0, 0, tzinfo=collab.timezone.utc)
+        tpl = ROOT / ".github" / "ISSUE_TEMPLATE" / "task.md"
+        self.assertTrue(tpl.exists(), "缺少工单模板")
+        self.assertIn("## 派单偏好", tpl.read_text(encoding="utf-8"))
+        body = "## 派单偏好\n\n<!-- 说明文字 -->\n仅限：gpt\n"
+        hard = {"labels": [{"name": "tier:hard"}], "createdAt": now.isoformat(), "body": body}
+        self.assertTrue(collab.check_stage_eligibility(hard, "gpt", cfg, now=now, role="dev"))
+        self.assertFalse(collab.check_stage_eligibility(hard, "qianwen", cfg, now=now, role="dev"))
+
 
 class TestV26Proxy(RepoFixture):
     def setUp(self):
@@ -1069,6 +1126,15 @@ class TestV26Proxy(RepoFixture):
         self.assertIn("collab:authors=qianwen", body)
         self.assertIn("collab:families=qwen", body)
         self.assertIn("submit-proxy=true", body)
+
+    def test_submit_family_override(self):
+        self._prepare_branch()
+        self.write_state({"issues": {"1": self.issue(labels=["status:in-progress"])}, "pr": None})
+        p = run_tool(self.repo, "submit", "--member", "antigravity", "--family", "claude", "--summary", "x", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        create = [c for c in self.read_log() if c["args"][:2] == ["pr", "create"]]
+        self.assertTrue(create, self.read_log())
+        self.assertIn("collab:families=claude", create[0]["stdin"])
 
 
 class TestV26Takeover(RepoFixture):

@@ -215,6 +215,15 @@ def locks_dir(root: Path) -> Path:
     return collab_meta_dir(root) / "locks"
 
 
+def clear_member_lock(root: Path, member: str) -> None:
+    """清理成员防重入锁：submit/review-submit/release 成功后调用，避免 30 分钟空等。"""
+    lock = locks_dir(root) / f"{member}.json"
+    try:
+        lock.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def attempts_dir(root: Path) -> Path:
     return collab_meta_dir(root) / "attempts"
 
@@ -584,10 +593,12 @@ def check_stage_eligibility(item: dict, member: str, cfg: dict, now=None, role="
         elapsed = float("inf")
     else:
         elapsed = _elapsed_minutes(item, now)
-    allowed_pools = []
+    # 解锁语义：后面的档位是“补位”，累加前面已开放的池，而不是整体替换。
+    # 否则满 15 分钟后 @free 反而失去资格，与「无缝补位」相悖。
+    allowed_pools = set()
     for stage in stages:
         if elapsed >= stage.get("after_minutes", 0):
-            allowed_pools = [a.lstrip("@") for a in stage.get("allow", [])]
+            allowed_pools.update(a.lstrip("@") for a in stage.get("allow", []))
     if not pools:
         # 旧 families 注册的成员无 pools：视为任何池都放行（只要阶梯已解锁到有池）
         return bool(allowed_pools)
@@ -1137,7 +1148,7 @@ def cmd_claim(args):
 
     issue = gh_json(
         root,
-        ["issue", "view", str(args.issue), "--json", "number,title,body,state,url,labels"],
+        ["issue", "view", str(args.issue), "--json", "number,title,body,state,url,labels,createdAt,updatedAt"],
     )
     if issue.get("state") != "OPEN":
         raise Fail(f"Issue #{args.issue} 不是打开状态（{issue.get('state')}）")
@@ -1319,6 +1330,7 @@ def cmd_release(args):
     )
     gh(root, ["issue", "comment", str(args.issue), "--body-file", "-"], input_text=comment)
     gh_issue_labels(root, args.issue, add=["status:ready"], remove=["status:in-progress", "status:rework"])
+    clear_member_lock(root, member)
     extra = "（已 fallback-now 0 秒解锁下一档算力池）" if getattr(args, "fallback_now", False) else ""
     out(f"✓ 已退单 Issue #{args.issue}：退回 status:ready（原因：{reason}）{extra}")
     return 0
@@ -1571,7 +1583,8 @@ def cmd_submit(args):
     if receipt.get("config_sha256") != config_sha256(root):
         raise Fail("回执绑定的 .collab/config.json 与当前配置不一致；配置被改过，重新跑 gate")
 
-    resolve_family(member, cfg, getattr(args, "family", "") or None)  # 未登记成员失败关闭
+    family_override = getattr(args, "family", "") or None
+    resolve_family(member, cfg, family_override)  # 未登记成员失败关闭（含覆写校验）
     authors = [member]
     for extra in args.co_author or []:
         extra = require_member(extra)
@@ -1579,7 +1592,7 @@ def cmd_submit(args):
             authors.append(extra)
     families = []
     for author in authors:
-        fam = resolve_family(author, cfg)
+        fam = resolve_family(author, cfg, family_override if author == member else None)
         if fam not in families:
             families.append(fam)
     summary = args.summary
@@ -1681,6 +1694,7 @@ def cmd_submit(args):
         out("⚠️  命中高危路径，已标 risk:high：" + ", ".join(risk))
     out("下一步：等未参与创作且异族的成员执行")
     out(f"  python3 scripts/collab.py review <PR号> --member <验收ID> --sha {head}")
+    clear_member_lock(root, member)
     return 0
 
 
@@ -2018,6 +2032,7 @@ def cmd_review_submit(args):
         out("  标签：status:review + review:agent-passed（等待人终审验收并设 status:ready-to-merge / 合并；同账号报告不等于原生 Approval）")
     else:
         out("  标签：status:rework（作者在原分支追加 commit 后重新 submit）")
+    clear_member_lock(root, member)
     return 0
 
 
@@ -2111,9 +2126,9 @@ def fuse_issue(root: Path, issue_no: int, member: str, target_key: str, max_atte
 
 
 def list_issues(root: Path, label=None, limit=200):
-    args = ["issue", "list", "--state", "open", "--limit", str(limit), "--json", "number,title,labels,body,state"]
+    args = ["issue", "list", "--state", "open", "--limit", str(limit), "--json", "number,title,labels,body,state,createdAt,updatedAt"]
     if label:
-        args = ["issue", "list", "--state", "open", "--label", label, "--limit", str(limit), "--json", "number,title,labels,body,state"]
+        args = ["issue", "list", "--state", "open", "--label", label, "--limit", str(limit), "--json", "number,title,labels,body,state,createdAt,updatedAt"]
     return gh_json(root, args) or []
 
 
@@ -2121,7 +2136,7 @@ def list_prs(root: Path, limit=200):
     return gh_json(
         root,
         ["pr", "list", "--state", "open", "--limit", str(limit), "--json",
-         "number,title,headRefOid,baseRefName,author,body,isCrossRepository"],
+         "number,title,headRefOid,baseRefName,author,body,isCrossRepository,createdAt,updatedAt"],
     ) or []
 
 
@@ -2512,6 +2527,7 @@ def build_parser():
 
     p = sub.add_parser("next", help="自治雷达：按优先级返回唯一下一步动作")
     p.add_argument("--member", required=True)
+    p.add_argument("--family", default=argparse.SUPPRESS, help="多模型宿主临时家族覆写（如 antigravity --family claude）")
     p.add_argument("--role", choices=["any", "dev", "review"], default="any", help="any=全部；dev=跳过审查；review=只看审查")
     p.add_argument("--json", action="store_true", help="输出机器可读 JSON")
     p.set_defaults(func=cmd_next)
@@ -2519,12 +2535,14 @@ def build_parser():
     p = sub.add_parser("claim", help="领取工单并建隔离工作区")
     p.add_argument("issue", type=int)
     p.add_argument("--member", required=True)
+    p.add_argument("--family", default=argparse.SUPPRESS, help="多模型宿主临时家族覆写（如 antigravity --family claude）")
     p.add_argument("--offline", action="store_true", help="离线模式（跳过远端同名分支检查）")
     p.set_defaults(func=cmd_claim)
 
     p = sub.add_parser("release", help="主动退单，将 in-progress/rework 退回 ready")
     p.add_argument("issue", type=int)
     p.add_argument("--member", required=True)
+    p.add_argument("--family", default=argparse.SUPPRESS, help="多模型宿主临时家族覆写（如 antigravity --family claude）")
     p.add_argument("--reason", required=True, help="退单原因（写进 Issue 评论）")
     p.add_argument("--fallback-now", action="store_true", help="0 秒解锁下一档算力池（断粮即交接）")
     p.set_defaults(func=cmd_release)
@@ -2538,6 +2556,7 @@ def build_parser():
 
     p = sub.add_parser("submit", help="校验回执、push、开/更 PR")
     p.add_argument("--member", required=True)
+    p.add_argument("--family", default=argparse.SUPPRESS, help="多模型宿主临时家族覆写（如 antigravity --family claude）")
     p.add_argument("--summary", default="", help="一句话变更说明")
     p.add_argument("--co-author", action="append", default=[], help="额外作者 member，可重复")
     p.add_argument("--proxy", action="store_true", help="无终端成员代录提交（保留真实 authors/families，标记 proxy=true）")
@@ -2546,6 +2565,7 @@ def build_parser():
     p = sub.add_parser("review", help="校验 SHA/独立性并准备验收工作区与报告骨架")
     p.add_argument("pr", type=int)
     p.add_argument("--member", required=True)
+    p.add_argument("--family", default=argparse.SUPPRESS, help="多模型宿主临时家族覆写（如 antigravity --family claude）")
     p.add_argument("--sha", required=True, help="期望的 PR head SHA；不匹配即拒绝")
     p.add_argument("--profile", choices=PROFILES)
     p.add_argument("--offline", action="store_true", help="离线模式（跳过 origin 主干同步校验）")
@@ -2554,6 +2574,7 @@ def build_parser():
     p = sub.add_parser("review-submit", help="提交具名验收/返工报告")
     p.add_argument("pr", type=int)
     p.add_argument("--member", required=True)
+    p.add_argument("--family", default=argparse.SUPPRESS, help="多模型宿主临时家族覆写（如 antigravity --family claude）")
     p.add_argument("--sha", required=True)
     p.add_argument("--file", required=True)
     p.add_argument("--verdict", choices=["pass", "rework"], required=True)
@@ -2563,6 +2584,7 @@ def build_parser():
     p = sub.add_parser("accept", help="人类终审验收：清除 review 标签并加 ready-to-merge")
     p.add_argument("pr", type=int)
     p.add_argument("--member", required=True, help="终审人 member ID（人类）")
+    p.add_argument("--family", default=argparse.SUPPRESS, help="多模型宿主临时家族覆写（如 antigravity --family claude）")
     p.add_argument("--allow-same-family", action="store_true", help="单模型紧急降级：允许同族 PASS 终审（留痕）")
     p.set_defaults(func=cmd_accept)
 

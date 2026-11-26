@@ -26,12 +26,11 @@ assignees: ""
 
 <!-- 有依赖就写 Issue 编号，例如：#12, #13。被依赖的 Issue 必须已关闭才能领取。 -->
 
-## 档位与派单偏好
+## 派单偏好
 
-- 档位：`tier:basic`（基础实现，@free 0 分钟抢跑）/ `tier:standard`（默认）/ `tier:hard`（高难方案与接口骨架，仅 @elite）
-- 派单偏好（可选）：指定成员 `优先：qianwen` / 家族 `优先：qwen` / 算力池 `仅限：@elite`
-
-<!-- 由人在打 status:ready 时按需添加 tier:* 标签；本小节可选，缺省按 routing.default_tier。 -->
+<!-- 可选：需要点将时，把本注释替换为一行指令（档位由人打 tier:basic/standard/hard 标签，不写在本小节）。
+     优先：qianwen, baizhi   （列表成员 0 分钟抢跑，超窗后按 tier 阶梯兜底）
+     仅限：@elite            （严格锁定，仅列表成员可领） -->
 
 ## 输入
 
