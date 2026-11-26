@@ -1,0 +1,71 @@
+{
+  "schema": 2,
+  "default_branch": "main",
+  "worktree_root": ".collab/worktrees",
+  "require_cross_family_review": true,
+  "trusted_github_logins": [
+    "juexing1225"
+  ],
+  "max_wip_per_member": 1,
+  "max_rework_rounds": 3,
+  "max_attempts_per_target": 2,
+  "review_lease_minutes": 30,
+  "active_session_minutes": 30,
+  "families": {
+    "antigravity": "gemini",
+    "gemini": "gemini",
+    "dsh": "deepseek",
+    "deepseek": "deepseek",
+    "baizhi": "baizhi",
+    "ohmyagent": "baizhi",
+    "workbuddy": "workbuddy",
+    "gpt": "openai",
+    "human": "human"
+  },
+  "protected_files": [
+    "docs/ARCHITECTURE.md",
+    "scripts/collab.py",
+    "scripts/gate.sh",
+    ".collab/config.json",
+    ".github/workflows/**",
+    ".github/ISSUE_TEMPLATE/**"
+  ],
+  "review_highlight_globs": [
+    "engine/**",
+    "kits/**",
+    "**/*.json",
+    "**/*.sh"
+  ],
+  "secret_globs": [
+    ".env",
+    ".env.*",
+    "*.pem",
+    "**/*.pem",
+    "*.p12",
+    "**/*.p12",
+    "*.key",
+    "**/*.key",
+    "id_rsa*",
+    "**/id_rsa*",
+    "credentials*.json",
+    "**/credentials*.json"
+  ],
+  "secret_exclude": [
+    "**/*.example",
+    "**/*.sample",
+    "**/testdata/**",
+    "**/fixtures/**"
+  ],
+  "gate": {
+    "fast": [
+      "python3 engine/build.py"
+    ],
+    "full": [
+      "python3 engine/build.py",
+      "python3 kits/build_kits.py"
+    ],
+    "timeout_seconds": 1800,
+    "submit_profile": "fast",
+    "review_profile": "fast"
+  }
+}
