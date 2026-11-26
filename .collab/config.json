@@ -11,16 +11,52 @@
   "max_attempts_per_target": 2,
   "review_lease_minutes": 30,
   "active_session_minutes": 30,
-  "families": {
-    "antigravity": "gemini",
-    "gemini": "gemini",
-    "dsh": "deepseek",
-    "deepseek": "deepseek",
-    "baizhi": "baizhi",
-    "ohmyagent": "baizhi",
-    "workbuddy": "workbuddy",
-    "gpt": "openai",
-    "human": "human"
+  "members": {
+    "baizhi": {"family": "baizhi", "pools": ["free"]},
+    "ohmyagent": {"family": "baizhi", "pools": ["free"]},
+    "qianwen": {"family": "qwen", "pools": ["free"]},
+    "workbuddy": {"family": "workbuddy", "pools": ["free"]},
+    "workbuddy-ai": {"family": "workbuddy", "pools": ["free"]},
+    "dsh": {"family": "deepseek", "pools": ["abundant"]},
+    "gemini": {"family": "gemini", "pools": ["abundant", "elite"]},
+    "antigravity": {"family": "gemini", "pools": ["elite"]},
+    "antigravity-claude": {"family": "claude", "pools": ["elite"]},
+    "gpt": {"family": "openai", "pools": ["elite"]},
+    "human": {"family": "human", "pools": ["human"]}
+  },
+  "routing": {
+    "default_tier": "standard",
+    "tiers": {
+      "basic": {
+        "stages": [
+          {"after_minutes": 0, "allow": ["@free"]},
+          {"after_minutes": 15, "allow": ["@abundant"]}
+        ],
+        "review_stages": [
+          {"after_minutes": 0, "allow": ["@free", "@abundant"]},
+          {"after_minutes": 30, "allow": ["@elite"]}
+        ]
+      },
+      "standard": {
+        "stages": [
+          {"after_minutes": 0, "allow": ["@free"]},
+          {"after_minutes": 15, "allow": ["@abundant"]},
+          {"after_minutes": 45, "allow": ["@elite"]}
+        ],
+        "review_stages": [
+          {"after_minutes": 0, "allow": ["@abundant", "@free", "@elite"]}
+        ]
+      },
+      "hard": {
+        "stages": [
+          {"after_minutes": 0, "allow": ["@elite"]}
+        ],
+        "review_stages": [
+          {"after_minutes": 0, "allow": ["@elite"]},
+          {"after_minutes": 15, "allow": ["@abundant"]}
+        ]
+      }
+    }
   },
   "protected_files": [
     "docs/ARCHITECTURE.md",

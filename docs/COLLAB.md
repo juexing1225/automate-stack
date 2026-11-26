@@ -21,6 +21,10 @@
 | `status:rework` | 审查不通过，返工中 | `review-submit` |
 | `review:agent-passed` | 异族成员初审通过，等人终审（非阶段标） | `review-submit` |
 | `status:ready-to-merge` | 人已终审验收，等人合并 | **仅人** `accept` |
+| `tier:basic` | 基础实现/单测：0~15min 仅 `@free` 可领 | 人 / 拆单模板 |
+| `tier:standard` | 常规任务（默认档）：`@free→@abundant→@elite` 阶梯解锁 | 默认 / 人 |
+| `tier:hard` | 高难方案/接口骨架/验收设计：仅开放 `@elite` | 人 |
+| `prefer:<target>` | 点将：指定成员 / 家族 / 算力池（`prefer:qianwen` / `prefer:qwen` / `prefer:@elite`） | 人 |
 | `blocked:needs-design` | 需求/架构边界等人拍板 | 任何成员（须写原因） |
 | `blocked:needs-human` | 连续返工/无进展自动熔断，等人裁决 | 工具自动 |
 | `blocked:external` | 外部依赖阻塞 | 任何成员（须写原因） |
@@ -29,6 +33,13 @@
 
 Issue 关闭 = 完成（需要合并后验收的，保持打开到验收单完成）。
 **Issue 标签**是阶段真源（PR 不维护第二份阶段）；Projects 看板只是视图，不参与权限与验收。
+
+## 2.1 成员注册与算力池阶梯（`next` / `claim` 的白名单时间窗）
+
+- 成员在 `.collab/config.json` 的 `members` 里单行注册 `{family, pools}`，路由只认三个抽象算力池 `@free`（免费积分）/ `@abundant`（充裕主力）/ `@elite`（王牌智囊），白名单默认拒绝制，无需维护黑名单。
+- 新增智能体只需加 1 行（如 `"qianwen": {"family": "qwen", "pools": ["free"]}`），前缀继承（`qianwen-01` 自动归属 `qwen` 族与 `@free` 池），路由表与 `collab.py` 零修改。
+- `next` / `claim` 按 `routing.tiers` 的阶梯时间窗判定：`tier:basic` 0~15min 仅 `@free`，满 15min 解锁 `@abundant`；`tier:hard` 仅 `@elite`。`prefer:<target>` 标签或 Issue `## 派单偏好` 可单点覆盖。
+- 半途断粮（免费积分耗尽）可 `release --fallback-now` 0 秒交接下一档池；无终端成员由人 `pack` + `submit --proxy` / `review-submit --proxy` 对称代录（保留真实 `authors`/`families`）。
 
 ## 3. 领取
 

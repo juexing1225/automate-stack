@@ -33,7 +33,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-TOOL_VERSION = "2.3.0"
+TOOL_VERSION = "2.6.0"
 SCHEMA = 2
 EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 PROFILES = ("fast", "full")
@@ -60,6 +60,9 @@ LABELS = [
     ("status:rework", "d93f0b", "审查不通过，返工中"),
     ("review:agent-passed", "0e8a16", "异构成员初审通过，等待人终审验收"),
     ("status:ready-to-merge", "5319e7", "人已终审验收，等待合并"),
+    ("tier:basic", "0e8a16", "基础实现/单测：0~15min 仅 @free 可领"),
+    ("tier:standard", "0e8a16", "常规任务（默认档）：@free→@abundant→@elite 阶梯解锁"),
+    ("tier:hard", "d93f0b", "高难方案/接口骨架/验收设计：仅开放 @elite"),
     ("blocked:needs-design", "b60205", "需求/架构边界等待人拍板"),
     ("blocked:needs-human", "d93f0b", "连续返工/无进展自动熔断，等人裁决"),
     ("blocked:external", "b60205", "外部依赖阻塞"),
@@ -89,6 +92,8 @@ DEFAULT_CONFIG = {
         "gpt": "openai",
         "human": "human",
     },
+    "members": {},
+    "routing": {},
     "protected_files": [],
     "review_highlight_globs": [],
     "secret_globs": [],
@@ -275,6 +280,31 @@ def validate_config(cfg: dict) -> None:
     families = cfg.get("families")
     if not isinstance(families, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in families.items()):
         raise Fail("配置错误：families 必须是字符串到字符串的映射")
+    members = cfg.get("members")
+    if not isinstance(members, dict):
+        raise Fail("配置错误：members 必须是对象")
+    for mid, entry in members.items():
+        if not isinstance(entry, dict) or not isinstance(entry.get("family"), str) or not entry["family"]:
+            raise Fail(f"配置错误：members.{mid} 必须是含非空 family 的对象")
+        pools = entry.get("pools", [])
+        if not isinstance(pools, list) or not all(isinstance(p, str) for p in pools):
+            raise Fail(f"配置错误：members.{mid}.pools 必须是字符串数组")
+    routing = cfg.get("routing")
+    if not isinstance(routing, dict):
+        raise Fail("配置错误：routing 必须是对象")
+    tiers = routing.get("tiers", {})
+    if not isinstance(tiers, dict):
+        raise Fail("配置错误：routing.tiers 必须是对象")
+    for tier, spec in tiers.items():
+        if not isinstance(spec, dict):
+            raise Fail(f"配置错误：routing.tiers.{tier} 必须是对象")
+        for key in ("stages", "review_stages"):
+            stages = spec.get(key, [])
+            if not isinstance(stages, list):
+                raise Fail(f"配置错误：routing.tiers.{tier}.{key} 必须是数组")
+            for stage in stages:
+                if not isinstance(stage, dict) or not isinstance(stage.get("after_minutes"), int) or not isinstance(stage.get("allow"), list):
+                    raise Fail(f"配置错误：routing.tiers.{tier}.{key} 的每项必须是含 after_minutes 与 allow 数组的对象")
     gate = cfg.get("gate")
     if not isinstance(gate, dict):
         raise Fail("配置错误：gate 必须是对象")
@@ -380,19 +410,152 @@ def parse_families(body: str):
     return [x for x in re.split(r"[,\s]+", raw) if x]
 
 
-def resolve_family(member: str, cfg: dict) -> str:
-    """把 member 解析到底层模型/产品家族；未登记成员失败关闭（禁匿名绕过异族校验）。"""
+def resolve_member_entry(member: str, cfg: dict):
+    """返回成员的注册表条目 {family, pools}；优先 members，回退 families。未命中返回 None。"""
     key = (member or "").strip().lower()
+    members = cfg.get("members") or {}
+    if isinstance(members, dict) and members:
+        if key in members:
+            return members[key]
+        prefix = re.split(r"[-:]", key, maxsplit=1)[0]
+        if prefix and prefix in members:
+            return members[prefix]
+        return None
     families = cfg.get("families") or {}
     if key in families:
-        return families[key]
+        return {"family": families[key], "pools": []}
     prefix = re.split(r"[-:]", key, maxsplit=1)[0]
     if prefix and prefix in families:
-        return families[prefix]
+        return {"family": families[prefix], "pools": []}
+    return None
+
+
+def resolve_family(member: str, cfg: dict) -> str:
+    """把 member 解析到底层模型/产品家族；未登记成员失败关闭（禁匿名绕过异族校验）。"""
+    entry = resolve_member_entry(member, cfg)
+    if entry and entry.get("family"):
+        return entry["family"]
     raise Fail(
-        f"成员 `{member}` 未在 .collab/config.json 的 families 中登记；"
+        f"成员 `{member}` 未在 .collab/config.json 的 members/families 中登记；"
         f"请先登记其模型/产品家族，否则无法做异族交叉审查"
     )
+
+
+def resolve_pools(member: str, cfg: dict):
+    """返回成员的算力池列表（无 pools 声明时返回 []，视为不受池限制）。"""
+    entry = resolve_member_entry(member, cfg)
+    if not entry:
+        return []
+    pools = entry.get("pools") or []
+    return [p for p in pools if isinstance(p, str)]
+
+
+def parse_prefer(body: str):
+    """解析 Issue 正文 `## 派单偏好`，返回偏好 token 列表（如 qianwen / @elite / qwen）。"""
+    sec = section(body or "", "派单偏好")
+    if sec is None:
+        return []
+    text = strip_comments(sec)
+    tokens = re.findall(r"@?[A-Za-z][\w.-]*", text)
+    return tokens
+
+
+def item_tier(names) -> str:
+    for name in names:
+        if name in ("tier:basic", "tier:standard", "tier:hard"):
+            return name.split(":", 1)[1]
+    return ""
+
+
+def prefer_target(names, body=""):
+    """从标签 prefer:<x> 与正文「派单偏好」返回偏好 token 集合。"""
+    prefers = set()
+    for name in names:
+        if name.startswith("prefer:"):
+            prefers.add(name[len("prefer:"):].strip().lower())
+    for token in parse_prefer(body):
+        prefers.add(token.lower())
+    return prefers
+
+
+def prefer_matches(prefers, member: str, family: str, pools) -> bool:
+    if not prefers:
+        return False
+    member = member.strip().lower()
+    for token in prefers:
+        if token == member or token == family:
+            return True
+        if token.startswith("@"):
+            if token[1:] in (pools or []):
+                return True
+        elif token in (pools or []):
+            return True
+    return False
+
+
+def _elapsed_minutes(item: dict, now) -> float:
+    for field in ("createdAt", "updatedAt", "pushedAt", "created_at", "updated_at"):
+        raw = item.get(field)
+        if not raw:
+            continue
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return max(0.0, (now - dt).total_seconds() / 60.0)
+        except (ValueError, TypeError):
+            continue
+    return 0.0
+
+
+def check_stage_eligibility(item: dict, member: str, cfg: dict, now=None, role="dev") -> bool:
+    """无状态算力池阶梯判定：成员在当前时间窗是否有资格领取/审查该任务。
+
+    item：Issue 或 PR 的 JSON；role：dev（领单）或 review（审单）。
+    白名单默认拒绝：路由未配置时放行（向下兼容旧 config）。
+    """
+    now = now or datetime.now(timezone.utc)
+    entry = resolve_member_entry(member, cfg)
+    if not entry:
+        return False
+    family = entry.get("family", "")
+    pools = resolve_pools(member, cfg)
+    names = label_names(item)
+    # prefer 点将优先级最高，命中即放行
+    if prefer_matches(prefer_target(names, item.get("body") or ""), member, family, pools):
+        return True
+    routing = cfg.get("routing") or {}
+    tiers = routing.get("tiers") or {}
+    if not tiers:
+        return True  # 未配置阶梯 → 不限制
+    tier = item_tier(names) or routing.get("default_tier", "standard")
+    spec = tiers.get(tier) or tiers.get("standard") or {}
+    stages_key = "review_stages" if role == "review" else "stages"
+    stages = spec.get(stages_key) or []
+    if not stages:
+        return True
+    # fallback-now 0 秒解锁：带 fallback 标记直接视为已满全部时间窗
+    if item.get("_fallback_now"):
+        elapsed = float("inf")
+    else:
+        elapsed = _elapsed_minutes(item, now)
+    allowed_pools = []
+    for stage in stages:
+        if elapsed >= stage.get("after_minutes", 0):
+            allowed_pools = [a.lstrip("@") for a in stage.get("allow", [])]
+    if not pools:
+        # 旧 families 注册的成员无 pools：视为任何池都放行（只要阶梯已解锁到有池）
+        return bool(allowed_pools)
+    return any(p in allowed_pools for p in pools)
+
+
+def issue_fallback_now(root: Path, issue_no: int) -> bool:
+    """是否已出现 fallback=now 的释放评论（0 秒解锁下一档算力池）。"""
+    for item in issue_comments(root, issue_no):
+        marker = parse_marker_dict(item.get("body") or "", "release")
+        if marker and marker.get("fallback") == "now":
+            return True
+    return False
 
 
 def match_any(path: str, patterns) -> str:
@@ -911,6 +1074,16 @@ def cmd_claim(args):
             f"达到 max_wip_per_member={cfg['max_wip_per_member']}；先交单/退单再领新单"
         )
 
+    # 算力池阶梯判定：当前时间窗该成员是否有资格领取本单
+    if issue_fallback_now(root, args.issue):
+        issue["_fallback_now"] = True
+    if not check_stage_eligibility(issue, member, cfg, role="dev"):
+        family = resolve_family(member, cfg)
+        raise Fail(
+            f"成员 {member}（family={family}）当前不在本单的算力池白名单时间窗内；"
+            f"等阶梯解锁（满相应分钟）或由更高档池成员补位"
+        )
+
     deps = parse_deps(issue.get("body") or "")
     if deps is None:
         warn("Issue 没有『## 依赖』小节，按无依赖处理；建议补齐模板")
@@ -1057,11 +1230,13 @@ def cmd_release(args):
     comment = (
         f"**释放**：`{member}`\n\n"
         f"原因：{reason}\n\n"
-        f"<!-- collab:release issue={args.issue} member={member} -->\n"
+        f"<!-- collab:release issue={args.issue} member={member}"
+        f"{' fallback=now' if getattr(args, 'fallback_now', False) else ''} -->\n"
     )
     gh(root, ["issue", "comment", str(args.issue), "--body-file", "-"], input_text=comment)
     gh_issue_labels(root, args.issue, add=["status:ready"], remove=["status:in-progress", "status:rework"])
-    out(f"✓ 已退单 Issue #{args.issue}：退回 status:ready（原因：{reason}）")
+    extra = "（已 fallback-now 0 秒解锁下一档算力池）" if getattr(args, "fallback_now", False) else ""
+    out(f"✓ 已退单 Issue #{args.issue}：退回 status:ready（原因：{reason}）{extra}")
     return 0
 
 
@@ -1221,24 +1396,31 @@ def load_task(root: Path, issue: int):
     return text, title
 
 
-def pr_body(issue: int, member: str, authors, families, receipt: dict, account: str, summary: str, base_sha: str):
+def pr_body(issue: int, member: str, authors, families, receipt: dict, account: str, summary: str, base_sha: str, proxy=False):
     step_lines = "\n".join(
         f"- `{step['cmd']}` → {'通过' if step['exit'] == 0 else '失败'}（{step['seconds']}s）" for step in receipt["steps"]
     ) or "- 无"
     risk = receipt.get("risk_files") or []
     risk_line = ("- 高危路径：" + ", ".join(f"`{x}`" for x in risk)) if risk else "- 高危路径：无"
+    proxy_marker = f"<!-- collab:submit-proxy=true operator={account} -->\n" if proxy else ""
+    proxy_note = (
+        f"- 代录声明：本 PR 由 GitHub 账号 `{account}` 代逻辑成员 `{member}` 代录提交（`proxy=true`），"
+        f"仅作责任留痕，作者/家族身份以上方标记为准。\n"
+    ) if proxy else ""
     return (
         f"<!-- collab:issue={issue} -->\n"
         f"<!-- collab:member={member} -->\n"
         f"<!-- collab:authors={','.join(authors)} -->\n"
         f"<!-- collab:families={','.join(families)} -->\n"
-        f"<!-- collab:base={base_sha} -->\n\n"
+        f"<!-- collab:base={base_sha} -->\n"
+        f"{proxy_marker}\n"
         f"## 关联工单\n\nRefs #{issue}\n\n"
         f"## 成果作者\n\n"
         f"- member：{member}\n"
         f"- 作者集合：{', '.join(authors)}\n"
         f"- 家族集合：{', '.join(families)}\n"
-        f"- 实际操作账号：{account}\n\n"
+        f"- 实际操作账号：{account}\n"
+        f"{proxy_note}\n"
         f"## 修改说明\n\n{summary}\n\n"
         f"## 自检\n\n"
         f"- 门禁：`{receipt['profile']}` @ `{receipt['head_sha']}`\n"
@@ -1379,7 +1561,7 @@ def cmd_submit(args):
                     f"禁止 rebase/amend/force-push，请回退到追加 commit 的返工方式"
                 )
 
-    body = pr_body(issue, member, authors, families, receipt, account, summary, base_sha)
+    body = pr_body(issue, member, authors, families, receipt, account, summary, base_sha, proxy=bool(getattr(args, "proxy", False)))
 
     pushed = run(["git", "push", "-u", "origin", "HEAD"], root, timeout=300)
     if pushed.returncode != 0:
@@ -1421,7 +1603,7 @@ def cmd_submit(args):
 # ---------------------------------------------------------------- review
 
 
-def report_skeleton(pr: dict, member: str, account: str, head: str, base: str, authors, acceptance, gate_receipt):
+def report_skeleton(pr: dict, member: str, account: str, head: str, base: str, authors, families, acceptance, gate_receipt):
     if acceptance:
         evidence = "\n".join(f"- {item}：TODO（检查方法、实际结果、证据位置）" for item in acceptance)
     else:
@@ -1439,14 +1621,17 @@ def report_skeleton(pr: dict, member: str, account: str, head: str, base: str, a
         f"- 完整 head SHA：{head}\n"
         f"- 完整基线 SHA：{base}\n"
         f"- 作者集合：{', '.join(authors)}\n"
-        f"- 独立性：工具已校验 {member} 不在作者集合；人工复核：TODO（填写后删除）\n\n"
+        f"- 家族集合：{', '.join(families)}\n"
+        f"- 独立性：工具已校验 {member} 不在作者集合且家族异族；人工复核：TODO（填写后删除）\n\n"
         f"## 门禁复核\n\n"
         f"- 结果：{gate_line}\n"
         f"{steps}\n\n"
         f"## 逐项证据\n\n{evidence}\n\n"
         f"## 缺陷\n\n- 无\n\n"
         f"## 视角补充 / 需求盲点\n\n"
-        f"- TODO（简述隐含假设、未覆盖边界或关联影响；若确无盲点可写：无新增盲点）\n\n"
+        f"- 隐含假设：TODO（填写后删除；确无盲点写：无新增盲点）\n"
+        f"- 未覆盖边界：TODO（填写后删除；确无盲点写：无新增盲点）\n"
+        f"- 关联影响：TODO（填写后删除；确无盲点写：无新增盲点）\n\n"
         f"## 未验证项\n\n- 无（或逐项说明限制）\n\n"
         f"## 结论\n\nPASS / REWORK\n\n"
         f"> 把上面一行改成唯一的 `PASS` 或 `REWORK`，并把所有占位内容填掉后运行 review-submit。\n"
@@ -1592,7 +1777,7 @@ def cmd_review(args):
                 pass
 
     account = gh_login(root)
-    report = report_skeleton(pr, member, account, head, base, authors, acceptance, gate_receipt)
+    report = report_skeleton(pr, member, account, head, base, authors, author_families, acceptance, gate_receipt)
     reviews_dir = root / ".collab" / "reviews"
     reviews_dir.mkdir(parents=True, exist_ok=True)
     report_path = reviews_dir / f"pr-{args.pr}-{head[:7]}-draft.md"
@@ -1676,6 +1861,11 @@ def cmd_review_submit(args):
         perspective = section(text, "视角补充")
     if perspective is None or not strip_comments(perspective).strip():
         raise Fail("报告缺少『## 视角补充 / 需求盲点』小节或内容为空（若确无盲点可写：无新增盲点）")
+    persp_text = strip_comments(perspective)
+    for key in ("隐含假设", "未覆盖边界", "关联影响"):
+        m = re.search(key + r"\s*[:：]\s*(\S.*)", persp_text)
+        if not m or not m.group(1).strip():
+            raise Fail(f"报告『视角补充』缺少或未填写「{key}」小项（三小项必须齐全）")
 
     if args.verdict == "pass":
         receipt = find_receipt(root, head, cfg["gate"]["review_profile"], "review")
@@ -1973,11 +2163,14 @@ def cmd_next(args):
                         if not issue_no_str or not issue_no_str.isdigit():
                             continue
                         issue_no = int(issue_no_str)
-                        info = gh(root, ["issue", "view", issue_no_str, "--json", "labels"], check=False)
+                        info = gh(root, ["issue", "view", issue_no_str, "--json", "labels,body"], check=False)
                         names = []
+                        issue_body = ""
                         if info.returncode == 0:
                             try:
-                                names = label_names(json.loads(info.stdout))
+                                info_data = json.loads(info.stdout)
+                                names = label_names(info_data)
+                                issue_body = info_data.get("body") or ""
                             except json.JSONDecodeError:
                                 names = []
                         if "status:review" not in names:
@@ -1992,6 +2185,13 @@ def cmd_next(args):
                             continue
                         head_sha = pr.get("headRefOid", "")
                         if active_lease(pr_comments(root, pr["number"]), head_sha, member, cfg["review_lease_minutes"]):
+                            continue
+                        review_item = {
+                            "labels": [{"name": n} for n in names],
+                            "body": issue_body,
+                            "updatedAt": pr.get("updatedAt") or pr.get("createdAt"),
+                        }
+                        if not check_stage_eligibility(review_item, member, cfg, role="review"):
                             continue
                         pr_no = pr["number"]
                         key = f"pr#{pr_no}@{head_sha[:12]}"
@@ -2020,6 +2220,10 @@ def cmd_next(args):
                                     deps = []
                                 if not deps_closed(root, deps):
                                     continue
+                                if issue_fallback_now(root, issue["number"]):
+                                    issue["_fallback_now"] = True
+                                if not check_stage_eligibility(issue, member, cfg, role="dev"):
+                                    continue
                                 issue_no = issue["number"]
                                 key = f"issue#{issue_no}@ready"
 
@@ -2046,11 +2250,14 @@ def cmd_next(args):
             if not issue_no_str or not issue_no_str.isdigit():
                 continue
             issue_no = int(issue_no_str)
-            info = gh(root, ["issue", "view", issue_no_str, "--json", "labels"], check=False)
+            info = gh(root, ["issue", "view", issue_no_str, "--json", "labels,body"], check=False)
             names = []
+            issue_body = ""
             if info.returncode == 0:
                 try:
-                    names = label_names(json.loads(info.stdout))
+                    info_data = json.loads(info.stdout)
+                    names = label_names(info_data)
+                    issue_body = info_data.get("body") or ""
                 except json.JSONDecodeError:
                     names = []
             if "status:review" not in names or "review:agent-passed" in names:
@@ -2065,6 +2272,13 @@ def cmd_next(args):
                 continue
             head_sha = pr.get("headRefOid", "")
             if active_lease(pr_comments(root, pr["number"]), head_sha, member, cfg["review_lease_minutes"]):
+                continue
+            review_item = {
+                "labels": [{"name": n} for n in names],
+                "body": issue_body,
+                "updatedAt": pr.get("updatedAt") or pr.get("createdAt"),
+            }
+            if not check_stage_eligibility(review_item, member, cfg, role="review"):
                 continue
             pr_no = pr["number"]
             key = f"pr#{pr_no}@{head_sha[:12]}"
@@ -2114,6 +2328,10 @@ def cmd_pack(args):
         leaks = scan_text_secrets(body_text)
         if leaks:
             raise Fail("任务包正文疑似包含密钥，拒绝导出：" + ", ".join(leaks))
+        arch = ""
+        arch_path = root / "docs" / "ARCHITECTURE.md"
+        if arch_path.exists():
+            arch = arch_path.read_text(encoding="utf-8")
         content = (
             header
             + f"# 任务包 · Issue #{number}\n\n"
@@ -2122,10 +2340,11 @@ def cmd_pack(args):
             f"- 状态：{data.get('state', '')}\n"
             f"- 标签：{', '.join(label_names(data)) or '无'}\n\n"
             f"## 工单正文\n\n{body_text}\n\n"
+            f"## 整体架构（只读，供实现对齐）\n\n{arch}\n\n"
             f"## 执行约定\n\n"
             f"1. 不修改 `docs/ARCHITECTURE.md`、`scripts/collab.py`、`scripts/gate.sh`、`.collab/config.json`、CI。\n"
             f"2. 报告或补丁必须绑定完整 commit SHA。\n"
-            f"3. 无终端时把成果交回，由有仓库权限的人提交；`review-submit` 代录时保留你的 member 署名。\n"
+            f"3. 无终端时把成果交回，由有仓库权限的人提交；`submit --proxy` 代录时保留你的 member/family 署名。\n"
         )
     else:
         pr = gh_json(
@@ -2206,6 +2425,7 @@ def build_parser():
     p.add_argument("issue", type=int)
     p.add_argument("--member", required=True)
     p.add_argument("--reason", required=True, help="退单原因（写进 Issue 评论）")
+    p.add_argument("--fallback-now", action="store_true", help="0 秒解锁下一档算力池（断粮即交接）")
     p.set_defaults(func=cmd_release)
 
     p = sub.add_parser("gate", help="跑门禁并写绑定 SHA 的回执")
@@ -2219,6 +2439,7 @@ def build_parser():
     p.add_argument("--member", required=True)
     p.add_argument("--summary", default="", help="一句话变更说明")
     p.add_argument("--co-author", action="append", default=[], help="额外作者 member，可重复")
+    p.add_argument("--proxy", action="store_true", help="无终端成员代录提交（保留真实 authors/families，标记 proxy=true）")
     p.set_defaults(func=cmd_submit)
 
     p = sub.add_parser("review", help="校验 SHA/独立性并准备验收工作区与报告骨架")

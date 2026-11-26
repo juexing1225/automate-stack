@@ -546,7 +546,7 @@ class TestFlow(RepoFixture):
         # 少写一条验收项被拒
         partial = text.replace("TODO（检查方法、实际结果、证据位置）", "已检查：运行 check.py 通过")
         partial = partial.replace("人工复核：TODO（填写后删除）", "人工复核：未参与创作")
-        partial = partial.replace("TODO（简述隐含假设、未覆盖边界或关联影响；若确无盲点可写：无新增盲点）", "无新增盲点")
+        partial = partial.replace("TODO（填写后删除；确无盲点写：无新增盲点）", "无新增盲点")
         partial = partial.replace("PASS / REWORK", "PASS")
         partial = partial.replace("- A2：已检查：运行 check.py 通过\n", "")
         report.write_text(partial, encoding="utf-8")
@@ -560,7 +560,7 @@ class TestFlow(RepoFixture):
         # 填写完整报告
         text = text.replace("TODO（检查方法、实际结果、证据位置）", "已检查：运行 check.py 通过")
         text = text.replace("人工复核：TODO（填写后删除）", "人工复核：未参与创作")
-        text = text.replace("TODO（简述隐含假设、未覆盖边界或关联影响；若确无盲点可写：无新增盲点）", "无新增盲点")
+        text = text.replace("TODO（填写后删除；确无盲点写：无新增盲点）", "无新增盲点")
         text = text.replace("PASS / REWORK", "PASS")
         report.write_text(text, encoding="utf-8")
 
@@ -716,7 +716,10 @@ class TestFlow(RepoFixture):
         text = text.replace("PASS / REWORK", "PASS")
 
         no_persp = text.replace(
-            "## 视角补充 / 需求盲点\n\n- TODO（简述隐含假设、未覆盖边界或关联影响；若确无盲点可写：无新增盲点）\n\n",
+            "## 视角补充 / 需求盲点\n\n"
+            "- 隐含假设：TODO（填写后删除；确无盲点写：无新增盲点）\n"
+            "- 未覆盖边界：TODO（填写后删除；确无盲点写：无新增盲点）\n"
+            "- 关联影响：TODO（填写后删除；确无盲点写：无新增盲点）\n\n",
             "",
         )
         report.write_text(no_persp, encoding="utf-8")
@@ -727,7 +730,7 @@ class TestFlow(RepoFixture):
         self.assertEqual(p.returncode, 1)
         self.assertIn("视角补充", p.stderr)
 
-        filled = text.replace("TODO（简述隐含假设、未覆盖边界或关联影响；若确无盲点可写：无新增盲点）", "无新增盲点")
+        filled = text.replace("TODO（填写后删除；确无盲点写：无新增盲点）", "无新增盲点")
         report.write_text(filled, encoding="utf-8")
         p = run_tool(
             self.repo, "review-submit", "1", "--member", "gpt", "--sha", head,
@@ -862,7 +865,7 @@ class TestV23(RepoFixture):
         text = report.read_text(encoding="utf-8")
         text = text.replace("TODO（检查方法、实际结果、证据位置）", "已检查：通过")
         text = text.replace("人工复核：TODO（填写后删除）", "人工复核：无参与")
-        text = text.replace("TODO（简述隐含假设、未覆盖边界或关联影响；若确无盲点可写：无新增盲点）", "无新增盲点")
+        text = text.replace("TODO（填写后删除；确无盲点写：无新增盲点）", "无新增盲点")
         text = text.replace("PASS / REWORK", "REWORK")
         report.write_text(text, encoding="utf-8")
         p = run_tool(
@@ -884,7 +887,7 @@ class TestV23(RepoFixture):
         text = report.read_text(encoding="utf-8")
         text = text.replace("TODO（检查方法、实际结果、证据位置）", "已检查：通过")
         text = text.replace("人工复核：TODO（填写后删除）", "人工复核：无参与")
-        text = text.replace("TODO（简述隐含假设、未覆盖边界或关联影响；若确无盲点可写：无新增盲点）", "无新增盲点")
+        text = text.replace("TODO（填写后删除；确无盲点写：无新增盲点）", "无新增盲点")
         text = text.replace("PASS / REWORK", "REWORK")
         # 缺陷描述里出现合法 "TODO" 字样（非占位符 TODO（）
         text = text.replace("## 缺陷\n\n- 无\n", "## 缺陷\n\n- R1：第 12 行残留 TODO 注释需清理\n")
@@ -916,6 +919,120 @@ class TestV23(RepoFixture):
         p = run_tool(self.repo, "submit", "--member", "alice", env=self.env)
         self.assertEqual(p.returncode, 1)
         self.assertIn("历史作者标记", p.stderr)
+
+
+V26_MEMBERS = {
+    "baizhi": {"family": "baizhi", "pools": ["free"]},
+    "qianwen": {"family": "qwen", "pools": ["free"]},
+    "workbuddy": {"family": "workbuddy", "pools": ["free"]},
+    "dsh": {"family": "deepseek", "pools": ["abundant"]},
+    "gemini": {"family": "gemini", "pools": ["abundant", "elite"]},
+    "antigravity": {"family": "gemini", "pools": ["elite"]},
+    "gpt": {"family": "openai", "pools": ["elite"]},
+    "human": {"family": "human", "pools": ["human"]},
+}
+
+V26_ROUTING = {
+    "default_tier": "standard",
+    "tiers": {
+        "basic": {
+            "stages": [
+                {"after_minutes": 0, "allow": ["@free"]},
+                {"after_minutes": 15, "allow": ["@abundant"]},
+            ],
+            "review_stages": [
+                {"after_minutes": 0, "allow": ["@free", "@abundant"]},
+                {"after_minutes": 30, "allow": ["@elite"]},
+            ],
+        },
+        "standard": {
+            "stages": [
+                {"after_minutes": 0, "allow": ["@free"]},
+                {"after_minutes": 15, "allow": ["@abundant"]},
+                {"after_minutes": 45, "allow": ["@elite"]},
+            ],
+            "review_stages": [
+                {"after_minutes": 0, "allow": ["@abundant", "@free", "@elite"]},
+            ],
+        },
+        "hard": {
+            "stages": [
+                {"after_minutes": 0, "allow": ["@elite"]},
+            ],
+            "review_stages": [
+                {"after_minutes": 0, "allow": ["@elite"]},
+                {"after_minutes": 15, "allow": ["@abundant"]},
+            ],
+        },
+    },
+}
+
+
+def v26_cfg():
+    return {"members": V26_MEMBERS, "routing": V26_ROUTING, "families": {}}
+
+
+class TestV26(unittest.TestCase):
+    def test_resolve_family_members_and_prefix(self):
+        cfg = v26_cfg()
+        self.assertEqual(collab.resolve_family("qianwen", cfg), "qwen")
+        self.assertEqual(collab.resolve_family("qianwen-01", cfg), "qwen")
+        self.assertEqual(collab.resolve_family("gemini", cfg), "gemini")
+        with self.assertRaises(collab.Fail):
+            collab.resolve_family("stranger", cfg)
+
+    def test_pool_eligibility_basic_ladder(self):
+        cfg = v26_cfg()
+        now = collab.datetime(2026, 11, 26, 17, 0, 0, tzinfo=collab.timezone.utc)
+        basic = {"labels": [{"name": "tier:basic"}], "createdAt": now.isoformat()}
+        # 0 分钟：仅 @free 可领；@abundant(gemini) 未解锁
+        self.assertTrue(collab.check_stage_eligibility(basic, "qianwen", cfg, now=now, role="dev"))
+        self.assertFalse(collab.check_stage_eligibility(basic, "gemini", cfg, now=now, role="dev"))
+        # 满 15 分钟：@abundant 自动补位
+        later = now + collab.timedelta(minutes=20)
+        self.assertTrue(collab.check_stage_eligibility(basic, "gemini", cfg, now=later, role="dev"))
+        # tier:hard 仅 @elite；@free 被拒之门外
+        hard = {"labels": [{"name": "tier:hard"}], "createdAt": now.isoformat()}
+        self.assertTrue(collab.check_stage_eligibility(hard, "gpt", cfg, now=now, role="dev"))
+        self.assertFalse(collab.check_stage_eligibility(hard, "qianwen", cfg, now=now, role="dev"))
+
+    def test_prefer_override(self):
+        cfg = v26_cfg()
+        now = collab.datetime(2026, 11, 26, 17, 0, 0, tzinfo=collab.timezone.utc)
+        hard = {"labels": [{"name": "tier:hard"}, {"name": "prefer:qianwen"}], "createdAt": now.isoformat()}
+        self.assertTrue(collab.check_stage_eligibility(hard, "qianwen", cfg, now=now, role="dev"))
+
+    def test_review_free_triangle(self):
+        cfg = v26_cfg()
+        now = collab.datetime(2026, 11, 26, 17, 0, 0, tzinfo=collab.timezone.utc)
+        basic = {"labels": [{"name": "tier:basic"}], "createdAt": now.isoformat(), "body": ""}
+        # basic 单 review 0 分钟开放 @free，异族三角互审放行
+        self.assertTrue(collab.check_stage_eligibility(basic, "baizhi", cfg, now=now, role="review"))
+        self.assertTrue(collab.check_stage_eligibility(basic, "qianwen", cfg, now=now, role="review"))
+
+
+class TestV26Proxy(RepoFixture):
+    def setUp(self):
+        super().setUp()
+        cfg = json.loads((self.repo / ".collab" / "config.json").read_text(encoding="utf-8"))
+        cfg["members"] = V26_MEMBERS
+        cfg["routing"] = V26_ROUTING
+        cfg["families"] = {}
+        (self.repo / ".collab" / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "v26 config")
+
+    def test_submit_proxy_keeps_family(self):
+        head = self._prepare_branch()
+        self.write_state({"issues": {"1": self.issue(labels=["status:in-progress"])}, "pr": None})
+        p = run_tool(self.repo, "submit", "--member", "qianwen", "--proxy", "--summary", "x", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        create = [c for c in self.read_log() if c["args"][:2] == ["pr", "create"]]
+        self.assertTrue(create, self.read_log())
+        body = create[0]["stdin"]
+        self.assertIn("collab:authors=qianwen", body)
+        self.assertIn("collab:families=qwen", body)
+        self.assertIn("submit-proxy=true", body)
 
 
 if __name__ == "__main__":
