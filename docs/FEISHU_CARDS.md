@@ -56,6 +56,9 @@ python3 scripts/feishu_card_worker.py --repo . --operators <你的 open_id ou_xx
 - Feishu 开发者后台「事件与回调 → 回调配置」需开启 `card.action.trigger`（本机已开，
   可用 `lark-cli event consume card.action.trigger --as bot --dry-run` 复查）。
 - `gh` 已登录且对仓库有合并权限；`lark-cli` 已登录为机器人身份。
+- `card.action.trigger` **同一机器人只允许一个消费者**。启动 worker 前先
+  `lark-cli event status` 确认没有别的进程在消费该事件（本机可能有另一套 agent 系统占着），
+  有的话先停掉它再启动本 worker，否则按钮点击会落到旧消费者手里、不会执行合并。
 
 ## 定时巡检（自治值班）
 

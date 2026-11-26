@@ -187,7 +187,9 @@ def main(argv: list[str] | None = None) -> int:
         print("（dry-run）将监听：", " ".join(cmd), file=sys.stderr)
 
     seen: set[str] = set()
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=None, text=True)
+    # stdin 必须保持打开：`event consume` 把 stdin EOF 当作退出信号。用 PIPE 并永不写入/关闭，
+    # 让子进程一直阻塞读、不收到 EOF，从而持续监听事件。
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=None, text=True, stdin=subprocess.PIPE)
     assert proc.stdout is not None
     try:
         for line in proc.stdout:
