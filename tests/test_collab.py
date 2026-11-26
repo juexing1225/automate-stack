@@ -17,6 +17,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -1191,6 +1192,190 @@ class TestV26Takeover(RepoFixture):
         p = run_tool(self.repo, "next", "--member", "gemini", "--json", env=self.env)
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
         self.assertEqual(json.loads(p.stdout)["action"], "idle")
+
+
+class TestStage4Kernel(unittest.TestCase):
+    """Stage 4A 前置 5 项内核补丁（G1-02 ~ G1-05）的纯函数测试。"""
+
+    def _lease(self, sha, member="gemini", family="gemini", minutes=30):
+        exp = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat().replace("+00:00", "Z")
+        return {"body": f"<!-- collab:review-lease pr=1 sha={sha} member={member} family={family} expires_at={exp} -->"}
+
+    def _second_review(self, sha, exclude_member="gemini", exclude_family="gemini", lease_release_for=None):
+        lrf = lease_release_for if lease_release_for is not None else sha
+        return {
+            "body": (
+                f"<!-- collab:second-review pr=1 sha={sha} exclude_member={exclude_member} "
+                f"exclude_family={exclude_family} lease_release_for={lrf} requested_by=human -->"
+            )
+        }
+
+    def test_active_lease_invalidated_by_second_review(self):
+        sha = "a" * 40
+        comments = [self._lease(sha), self._second_review(sha)]
+        self.assertIsNone(collab.active_lease(comments, sha, "antigravity", 30))
+
+    def test_active_lease_kept_without_second_review(self):
+        sha = "a" * 40
+        comments = [self._lease(sha)]
+        self.assertIsNotNone(collab.active_lease(comments, sha, "antigravity", 30))
+
+    def test_active_lease_kept_when_second_review_for_other_sha(self):
+        sha = "a" * 40
+        comments = [self._lease(sha), self._second_review("b" * 40)]
+        self.assertIsNotNone(collab.active_lease(comments, sha, "antigravity", 30))
+
+    def test_active_lease_kept_when_second_review_precedes_lease(self):
+        sha = "a" * 40
+        comments = [self._second_review(sha), self._lease(sha)]
+        self.assertIsNotNone(collab.active_lease(comments, sha, "antigravity", 30))
+
+    def test_second_review_exclusions(self):
+        sha = "a" * 40
+        comments = [self._second_review(sha)]
+        self.assertEqual(collab.second_review_exclusions(comments, sha), ({"gemini"}, {"gemini"}))
+        self.assertEqual(collab.second_review_exclusions(comments, "b" * 40), (set(), set()))
+
+    def test_parse_ts_handles_z_and_offset(self):
+        self.assertIsNotNone(collab._parse_ts("2026-11-27T01:00:00Z"))
+        self.assertIsNotNone(collab._parse_ts("2026-11-27T01:00:00+00:00"))
+        self.assertIsNone(collab._parse_ts("not-a-time"))
+
+    def test_rework_via_feishu_parsed(self):
+        sha = "a" * 40
+        comments = [
+            {"body": f"意见正文\n\n<!-- collab:review pr=1 sha={sha} member=human family=human verdict=REWORK via=feishu -->"}
+        ]
+        self.assertIsNotNone(collab.latest_rework_body(comments))
+        self.assertEqual(collab.count_rework_verdicts(comments), 1)
+
+
+class TestStage4KernelIntegration(RepoFixture):
+    """Stage 4A 前置 5 项内核补丁（G1-02 ~ G1-05）的集成测试（假 gh）。"""
+
+    def test_accept_rejects_sha_mismatch(self):
+        head = self._prepare_branch()
+        pass_comment = (
+            f"<!-- collab:review pr=1 issue=1 sha={head} member=antigravity "
+            f"family=gemini verdict=PASS proxy=false -->\n"
+        )
+        self.submitted_pr_state(
+            head, authors="alice", families="alice",
+            issue_labels=["status:review", "review:agent-passed"],
+            comments=[{"body": pass_comment}],
+        )
+        git(self.repo, "checkout", "-q", "main")
+        p = run_tool(self.repo, "accept", "1", "--member", "human", "--sha", "b" * 40, env=self.env)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("过期终审", p.stderr)
+
+    def test_accept_ok_with_matching_sha(self):
+        head = self._prepare_branch()
+        pass_comment = (
+            f"<!-- collab:review pr=1 issue=1 sha={head} member=antigravity "
+            f"family=gemini verdict=PASS proxy=false -->\n"
+        )
+        self.submitted_pr_state(
+            head, authors="alice", families="alice",
+            issue_labels=["status:review", "review:agent-passed"],
+            comments=[{"body": pass_comment}],
+        )
+        git(self.repo, "checkout", "-q", "main")
+        p = run_tool(self.repo, "accept", "1", "--member", "human", "--sha", head, env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+
+    def test_review_rejects_second_review_excluded(self):
+        head = self._prepare_branch()
+        second = (
+            f"<!-- collab:second-review pr=1 sha={head} exclude_member=gemini "
+            f"exclude_family=gemini lease_release_for={head} requested_by=human -->"
+        )
+        self.submitted_pr_state(
+            head, authors="alice", families="alice", issue_labels=["status:review"],
+            comments=[{"body": second}],
+        )
+        git(self.repo, "checkout", "-q", "main")
+        p = run_tool(self.repo, "review", "1", "--member", "antigravity", "--sha", head, env=self.env)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("二审", p.stderr)
+
+    def test_next_skips_second_review_excluded(self):
+        head = self._prepare_branch()
+        second = (
+            f"<!-- collab:second-review pr=1 sha={head} exclude_member=gemini "
+            f"exclude_family=gemini lease_release_for={head} requested_by=human -->"
+        )
+        self.submitted_pr_state(
+            head, authors="alice", families="alice", issue_labels=["status:review"],
+            comments=[{"body": second}],
+        )
+        git(self.repo, "checkout", "-q", "main")
+        p = run_tool(self.repo, "next", "--member", "antigravity", "--role", "review", "--json", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertEqual(json.loads(p.stdout)["action"], "idle")
+
+    def test_gate_remote_protected_approval(self):
+        # 改受保护文件并提交，PR 评论里有可信作者的 allow-protected 特批
+        with (self.repo / "docs" / "ARCHITECTURE.md").open("a", encoding="utf-8") as f:
+            f.write("\nagent changed this with remote approval\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "touch protected with remote approval")
+        head = self.head()
+        pr = {
+            "number": 1,
+            "url": "https://example.test/pull/1",
+            "headRefOid": head,
+            "isCrossRepository": False,
+            "comments": [
+                {
+                    "body": f"<!-- collab:allow-protected pr=1 sha={head} operator=fake-gh-user via=feishu -->",
+                    "author": {"login": "fake-gh-user"},
+                }
+            ],
+        }
+        self.write_state({"issues": {}, "pr": pr, "prs": []})
+        p = run_tool(self.repo, "gate", "--profile", "fast", "--check-remote-approval", "--pr", "1", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+
+    def test_gate_remote_approval_rejects_untrusted_author(self):
+        with (self.repo / "docs" / "ARCHITECTURE.md").open("a", encoding="utf-8") as f:
+            f.write("\nagent changed this\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "touch protected")
+        head = self.head()
+        pr = {
+            "number": 1,
+            "url": "https://example.test/pull/1",
+            "headRefOid": head,
+            "isCrossRepository": False,
+            "comments": [
+                {
+                    "body": f"<!-- collab:allow-protected pr=1 sha={head} operator=random-user via=feishu -->",
+                    "author": {"login": "random-user"},
+                }
+            ],
+        }
+        self.write_state({"issues": {}, "pr": pr, "prs": []})
+        p = run_tool(self.repo, "gate", "--profile", "fast", "--check-remote-approval", "--pr", "1", env=self.env)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("受保护文件", p.stdout)
+
+    def test_next_reset_attempts_cross_machine(self):
+        # 本地已熔断（count 达上限），但 Issue 评论存在更新的 reset-attempts 时归零继续
+        attempts_dir = self.repo / ".git" / "collab" / "attempts"
+        _mkdir(attempts_dir)
+        (attempts_dir / "alice.json").write_text(
+            json.dumps({"issue#1@ready": {"count": 2, "last_attempt_at": "2026-11-26T00:00:00+00:00"}}),
+            encoding="utf-8",
+        )
+        issue = self.issue(number=1, labels=["status:ready"])
+        issue["comments"] = [
+            {"body": "<!-- collab:reset-attempts member=alice ts=2026-11-27T00:00:00+00:00 via=feishu -->"}
+        ]
+        self.write_state({"issues": {"1": issue}, "pr": None, "prs": []})
+        p = run_tool(self.repo, "next", "--member", "alice", "--json", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertEqual(json.loads(p.stdout)["action"], "claim_issue")
 
 
 if __name__ == "__main__":
