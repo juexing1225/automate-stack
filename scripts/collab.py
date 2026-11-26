@@ -499,13 +499,18 @@ def parse_dispatch_preference(body: str):
     text = strip_comments(sec).strip()
     if not text:
         return None, []
-    m = re.search(r"(?:仅限|only)\s*[:：]\s*(.+)", text, re.I)
-    if m:
-        return "only", _split_targets(m.group(1))
-    m = re.search(r"(?:优先|prefer)\s*[:：]\s*(.+)", text, re.I)
-    if m:
-        return "prefer", _split_targets(m.group(1))
-    return "prefer", _split_targets(text)
+    # 只解析行首（可带列表符号）的明确指令，避免「指定成员 优先：x」这类说明文字误放行
+    for line in text.splitlines():
+        line = line.strip().lstrip("-*•").strip()
+        m = re.match(r"(?:仅限|only)\s*[:：]\s*(.+)", line, re.I)
+        if m:
+            return "only", _split_targets(m.group(1))
+    for line in text.splitlines():
+        line = line.strip().lstrip("-*•").strip()
+        m = re.match(r"(?:优先|prefer)\s*[:：]\s*(.+)", line, re.I)
+        if m:
+            return "prefer", _split_targets(m.group(1))
+    return None, []
 
 
 def item_tier(names) -> str:
@@ -554,6 +559,22 @@ def _elapsed_minutes(item: dict, now) -> float:
     return 0.0
 
 
+def _last_activity_minutes(item: dict, now) -> float:
+    """距最后活跃（updatedAt 优先）的分钟数；用于静默超时接管判定。"""
+    for field in ("updatedAt", "updated_at", "pushedAt", "createdAt", "created_at"):
+        raw = item.get(field)
+        if not raw:
+            continue
+        try:
+            dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return max(0.0, (now - dt).total_seconds() / 60.0)
+        except (ValueError, TypeError):
+            continue
+    return 0.0
+
+
 def check_stage_eligibility(item: dict, member: str, cfg: dict, now=None, role="dev") -> bool:
     """无状态算力池阶梯判定：成员在当前时间窗是否有资格领取/审查该任务。
 
@@ -583,6 +604,9 @@ def check_stage_eligibility(item: dict, member: str, cfg: dict, now=None, role="
     if not tiers:
         return True  # 未配置阶梯 → 不限制
     tier = item_tier(names) or routing.get("default_tier", "standard")
+    # 高风险变更：审查侧自动升级为 hard 级策略（方案：risk:high 审查走 hard 阶梯）
+    if role == "review" and "risk:high" in names:
+        tier = "hard"
     spec = tiers.get(tier) or tiers.get("standard") or {}
     stages_key = "review_stages" if role == "review" else "stages"
     stages = spec.get(stages_key) or []
@@ -646,7 +670,7 @@ def find_stale_takeover(root: Path, cfg: dict, member: str, now=None):
         owner = current_owner(issue_comments(root, issue["number"]))
         if not owner or not is_free_pool_member(owner, cfg):
             continue
-        if _elapsed_minutes(issue, now) < cfg["stale_takeover_minutes"]:
+        if _last_activity_minutes(issue, now) < cfg["stale_takeover_minutes"]:
             continue
         action = "takeover_rework" if "status:rework" in names else "takeover_in_progress"
         return issue, action
@@ -768,6 +792,25 @@ def scan_text_secrets(text: str):
         return []
     data = text.encode("utf-8", errors="replace")
     return [name for name, rx in SECRET_PATTERNS if rx.search(data)]
+
+
+def _named_sources(root: Path, body: str):
+    """从 Issue「## 输入」小节提取命名的源码文件快照，返回 {relpath: content}。"""
+    sec = section(body or "", "输入")
+    if sec is None:
+        return {}
+    text = strip_comments(sec)
+    result = {}
+    for match in re.finditer(r"([\w./-]+\.(?:py|js|ts|json|md|sh|ya?ml|toml|html|css))", text):
+        rel = match.group(1)
+        path = root / rel
+        if rel in result or not path.is_file():
+            continue
+        try:
+            result[rel] = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+    return result
 
 
 def tracked_secret_files(root: Path, cfg: dict):
@@ -2173,6 +2216,40 @@ def _emit(result: dict, args) -> int:
     return 0
 
 
+def _next_claim(root, cfg, member, member_family, pick) -> bool:
+    """P4：领取新就绪工单（WIP 未满 + 依赖关闭 + 阶梯放行）；返回是否命中。"""
+    wip = len(member_owned_issues(root, cfg, member, "status:in-progress")) + \
+          len(member_owned_issues(root, cfg, member, "status:rework"))
+    if wip >= cfg["max_wip_per_member"]:
+        return False
+    for issue in list_issues(root, "status:ready"):
+        names = label_names(issue)
+        if any(n.startswith("blocked:") for n in names):
+            continue
+        deps = parse_deps(issue.get("body") or "")
+        if deps is None:
+            deps = []
+        if not deps_closed(root, deps):
+            continue
+        if issue_fallback_now(root, issue["number"]):
+            issue["_fallback_now"] = True
+        if not check_stage_eligibility(issue, member, cfg, role="dev"):
+            continue
+        issue_no = issue["number"]
+        key = f"issue#{issue_no}@ready"
+
+        def build_claim(issue=issue, issue_no=issue_no):
+            return {
+                "action": "claim_issue", "member": member, "family": member_family,
+                "issue": issue_no, "pr": None, "head_sha": None,
+                "worktree": None, "rework_file": None,
+                "reason": f"P4：领取新就绪工单 #{issue_no}",
+            }
+        if pick(key, issue_no, build_claim):
+            return True
+    return False
+
+
 def cmd_next(args):
     root, cfg = context(args)
     member = require_member(args.member)
@@ -2306,35 +2383,11 @@ def cmd_next(args):
                         if pick(key, issue_no, build_review):
                             break
                     else:
-                        # P4 claim_issue
-                        wip = len(member_owned_issues(root, cfg, member, "status:in-progress")) + \
-                              len(member_owned_issues(root, cfg, member, "status:rework"))
-                        if wip < cfg["max_wip_per_member"]:
-                            for issue in list_issues(root, "status:ready"):
-                                names = label_names(issue)
-                                if any(n.startswith("blocked:") for n in names):
-                                    continue
-                                deps = parse_deps(issue.get("body") or "")
-                                if deps is None:
-                                    deps = []
-                                if not deps_closed(root, deps):
-                                    continue
-                                if issue_fallback_now(root, issue["number"]):
-                                    issue["_fallback_now"] = True
-                                if not check_stage_eligibility(issue, member, cfg, role="dev"):
-                                    continue
-                                issue_no = issue["number"]
-                                key = f"issue#{issue_no}@ready"
-
-                                def build_claim(issue=issue, issue_no=issue_no):
-                                    return {
-                                        "action": "claim_issue", "member": member, "family": member_family,
-                                        "issue": issue_no, "pr": None, "head_sha": None,
-                                        "worktree": None, "rework_file": None,
-                                        "reason": f"P4：领取新就绪工单 #{issue_no}",
-                                    }
-                                if pick(key, issue_no, build_claim):
-                                    break
+                        # P4 claim_issue（any：P3 无命中后领新单）
+                        _next_claim(root, cfg, member, member_family, pick)
+                else:
+                    # dev：跳过审查，直接领新单
+                    _next_claim(root, cfg, member, member_family, pick)
         # P1.5 接管（P1-P4 均未命中时评估）：免费池成员静默超时由备选梯队接管
         if result["action"] == "idle":
             takeover = find_stale_takeover(root, cfg, member, now)
@@ -2440,22 +2493,30 @@ def cmd_pack(args):
     if kind == "issue":
         data = gh_json(root, ["issue", "view", str(number), "--json", "number,title,body,state,url,labels"])
         body_text = data.get("body") or ""
-        leaks = scan_text_secrets(body_text)
-        if leaks:
-            raise Fail("任务包正文疑似包含密钥，拒绝导出：" + ", ".join(leaks))
         arch = ""
         arch_path = root / "docs" / "ARCHITECTURE.md"
         if arch_path.exists():
             arch = arch_path.read_text(encoding="utf-8")
+        sources = _named_sources(root, body_text)
+        # 密钥扫描覆盖最终导出的全部文本（正文 + 架构 + 关联源码），任一命中即拒绝
+        leaks = scan_text_secrets(body_text + "\n" + arch + "\n" + "\n".join(sources.values()))
+        if leaks:
+            raise Fail("任务包疑似包含密钥，拒绝导出：" + ", ".join(leaks))
+        base_sha = rev_parse(root, "HEAD") or ""
+        source_lines = "\n".join(
+            f"### `{rel}`\n\n```text\n{content}\n```\n" for rel, content in sources.items()
+        ) or "（无关联源码快照）"
         content = (
             header
             + f"# 任务包 · Issue #{number}\n\n"
             f"- 标题：{data.get('title', '')}\n"
             f"- URL：{data.get('url', '')}\n"
             f"- 状态：{data.get('state', '')}\n"
-            f"- 标签：{', '.join(label_names(data)) or '无'}\n\n"
+            f"- 标签：{', '.join(label_names(data)) or '无'}\n"
+            f"- 基线 SHA：`{base_sha}`\n\n"
             f"## 工单正文\n\n{body_text}\n\n"
             f"## 整体架构（只读，供实现对齐）\n\n{arch}\n\n"
+            f"## 关联源码快照\n\n{source_lines}\n"
             f"## 执行约定\n\n"
             f"1. 不修改 `docs/ARCHITECTURE.md`、`scripts/collab.py`、`scripts/gate.sh`、`.collab/config.json`、CI。\n"
             f"2. 报告或补丁必须绑定完整 commit SHA。\n"
@@ -2466,7 +2527,10 @@ def cmd_pack(args):
             root,
             ["pr", "view", str(number), "--json", "number,title,body,state,url,headRefOid,baseRefName,author"],
         )
-        diff = gh(root, ["pr", "diff", str(number)], check=False, timeout=120).stdout
+        diff = gh(root, ["pr", "diff", str(number)], check=False, timeout=120)
+        if diff.returncode != 0:
+            raise Fail("无法获取 PR diff，拒绝导出（避免半截审单包）：" + (diff.stderr or diff.stdout or "").strip()[:200])
+        diff = diff.stdout
         if len(diff) > 200_000:
             diff = diff[:200_000] + "\n\n…（diff 超过 200KB，已截断；请让成员按文件索取）\n"
         leaks = scan_text_secrets((pr.get("body") or "") + "\n" + diff)

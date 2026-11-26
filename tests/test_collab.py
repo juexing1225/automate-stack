@@ -1103,6 +1103,22 @@ class TestV26(unittest.TestCase):
         self.assertTrue(collab.check_stage_eligibility(hard, "gpt", cfg, now=now, role="dev"))
         self.assertFalse(collab.check_stage_eligibility(hard, "qianwen", cfg, now=now, role="dev"))
 
+    def test_risk_high_review_upgrades_to_hard(self):
+        # risk:high 的高风险单，审查侧走 hard 阶梯：@free 被拒，@elite 放行
+        cfg = v26_cfg()
+        now = collab.datetime(2026, 11, 26, 17, 0, 0, tzinfo=collab.timezone.utc)
+        risky = {"labels": [{"name": "tier:basic"}, {"name": "risk:high"}], "createdAt": now.isoformat(), "body": ""}
+        self.assertFalse(collab.check_stage_eligibility(risky, "qianwen", cfg, now=now, role="review"))
+        self.assertTrue(collab.check_stage_eligibility(risky, "gpt", cfg, now=now, role="review"))
+
+    def test_last_activity_prefers_updated_at(self):
+        # 静默接管判定用 updatedAt（最后活跃），旧 createdAt 但最近活跃不算 stale
+        now = collab.datetime(2026, 11, 26, 17, 0, 0, tzinfo=collab.timezone.utc)
+        item = {"createdAt": "2026-11-24T00:00:00Z", "updatedAt": now.isoformat()}
+        self.assertLess(collab._last_activity_minutes(item, now), 1.0)
+        stale = {"createdAt": "2026-11-24T00:00:00Z", "updatedAt": "2026-11-25T00:00:00Z"}
+        self.assertGreater(collab._last_activity_minutes(stale, now), 60.0)
+
 
 class TestV26Proxy(RepoFixture):
     def setUp(self):
