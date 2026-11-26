@@ -934,6 +934,16 @@ def latest_review_verdict(comments):
     return found
 
 
+def latest_rework_body(comments):
+    """返回最近一条 verdict=REWORK 的审查评论正文；无则 None。"""
+    found = None
+    for item in comments:
+        marker = parse_marker_dict(item.get("body") or "", "review")
+        if marker and marker.get("verdict", "").upper() == "REWORK":
+            found = item.get("body") or ""
+    return found
+
+
 def count_rework_verdicts(comments):
     """统计最近一次 collab:reset-rework 之后的 verdict=REWORK 次数。"""
     count = 0
@@ -1139,7 +1149,7 @@ def issue_comments(root: Path, issue_number: int):
 
 
 def current_owner(comments):
-    """最后一次 collab:release 之后首条有效 collab:claim 的 member；无则 None。"""
+    """最后一次 collab:release 之后首条有效 collab:claim/takeover 的 member；无则 None。"""
     owner = None
     for item in comments:
         body = item.get("body") or ""
@@ -1149,7 +1159,12 @@ def current_owner(comments):
         marker = parse_marker_dict(body, "claim")
         if marker and marker.get("member"):
             owner = marker["member"]
-        elif "collab:claim-nonce=" in body:
+            continue
+        takeover = parse_marker_dict(body, "takeover")
+        if takeover and takeover.get("to"):
+            owner = takeover["to"]
+            continue
+        if "collab:claim-nonce=" in body:
             fallback = parse_marker(body, "claim-member")
             if fallback:
                 owner = fallback
@@ -1184,10 +1199,67 @@ def member_wip(root: Path, cfg: dict, member: str):
     return wip
 
 
+def cmd_claim_takeover(root, cfg, member, args):
+    """接管静默超时的免费池在制/返工单：拉原分支建 worktree，写 collab:takeover 切换归属。"""
+    issue = gh_json(
+        root,
+        ["issue", "view", str(args.issue), "--json", "number,title,state,url,labels,createdAt,updatedAt"],
+    )
+    if issue.get("state") != "OPEN":
+        raise Fail(f"Issue #{args.issue} 不是打开状态（{issue.get('state')}）")
+    names = label_names(issue)
+    if "status:in-progress" not in names and "status:rework" not in names:
+        raise Fail(f"Issue #{args.issue} 不在 status:in-progress/rework，无需接管")
+    if any(n.startswith("blocked:") for n in names):
+        raise Fail(f"Issue #{args.issue} 已被 blocked:* 阻塞，不能接管")
+    old_owner = current_owner(issue_comments(root, args.issue))
+    if not old_owner or not is_free_pool_member(old_owner, cfg):
+        raise Fail(f"Issue #{args.issue} 归属 `{old_owner or '未知'}`，非免费池成员，不能接管")
+    if is_free_pool_member(member, cfg):
+        raise Fail(f"成员 {member} 是免费池成员，不能接管其他免费池单")
+    if _last_activity_minutes(issue, datetime.now(timezone.utc)) < cfg["stale_takeover_minutes"]:
+        raise Fail(f"Issue #{args.issue} 尚未静默超时（< {cfg['stale_takeover_minutes']} 分钟），暂不可接管")
+
+    branch = f"work/issue-{args.issue}"
+    run(["git", "fetch", "origin", branch, "--quiet"], root, timeout=120, check=False)
+    if not git_ok(root, "cat-file", "-e", f"origin/{branch}^{{commit}}"):
+        raise Fail(f"远端无分支 origin/{branch}，无法接管")
+
+    wt_root = (root / cfg["worktree_root"]).resolve()
+    wt_root.mkdir(parents=True, exist_ok=True)
+    wt = (wt_root / f"issue-{args.issue}").resolve()
+    if wt.exists():
+        raise Fail(f"工作区已存在：{wt}；确认无未提交成果后手工清理")
+    if git_ok(root, "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"):
+        p = run(["git", "worktree", "add", str(wt), branch], root, timeout=120)
+    else:
+        p = run(["git", "worktree", "add", "-b", branch, str(wt), f"origin/{branch}"], root, timeout=120)
+    if p.returncode != 0:
+        raise Fail(f"创建接管 worktree 失败：\n{(p.stderr or p.stdout).strip()}")
+    ensure_exclude(root)
+
+    comment = (
+        f"**接管**：`{member}` 接管 `{old_owner}` 的静默超时单。\n\n"
+        f"<!-- collab:takeover issue={args.issue} from={old_owner} to={member} "
+        f"reason=stale-{cfg['stale_takeover_minutes']}m -->\n"
+    )
+    gh(root, ["issue", "comment", str(args.issue), "--body-file", "-"], input_text=comment)
+
+    out(f"✓ 已接管 Issue #{args.issue}（原成员 {old_owner} 静默超时）")
+    out(f"  工作区：{wt}")
+    out(f"  分支：  {branch}")
+    out("下一步：")
+    out(f"  cd {wt}")
+    out(f"  python3 scripts/collab.py gate --profile fast")
+    return 0
+
+
 def cmd_claim(args):
     root, cfg = context(args)
     member = require_member(args.member)
     member_family = resolve_family(member, cfg, getattr(args, "family", "") or None)
+    if getattr(args, "takeover", False):
+        return cmd_claim_takeover(root, cfg, member, args)
 
     issue = gh_json(
         root,
@@ -2307,6 +2379,12 @@ def cmd_next(args):
                     "reason": f"P1：优先修复名下返工单 #{issue_no}" + (f"（PR #{pr_no}）" if pr_no else ""),
                 }
             if pick(key, issue_no, build_fix):
+                # 自动把最新 REWORK 评论落盘到 worktree，供执行者逐条修复
+                if pr_no:
+                    rework = latest_rework_body(pr_comments(root, pr_no))
+                    if rework:
+                        wt = (root / cfg["worktree_root"] / f"issue-{issue_no}").resolve()
+                        write_atomic(wt / ".collab" / "rework-latest.md", rework + "\n")
                 break
         else:
             # P2 resume_in_progress
@@ -2601,6 +2679,7 @@ def build_parser():
     p.add_argument("--member", required=True)
     p.add_argument("--family", default=argparse.SUPPRESS, help="多模型宿主临时家族覆写（如 antigravity --family claude）")
     p.add_argument("--offline", action="store_true", help="离线模式（跳过远端同名分支检查）")
+    p.add_argument("--takeover", action="store_true", help="接管静默超时的免费池在制/返工单（拉原分支继续开发）")
     p.set_defaults(func=cmd_claim)
 
     p = sub.add_parser("release", help="主动退单，将 in-progress/rework 退回 ready")

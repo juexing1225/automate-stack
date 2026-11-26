@@ -341,6 +341,13 @@ class TestPureFunctions(unittest.TestCase):
         for text, expected in cases.items():
             self.assertEqual(collab.parse_report_conclusion(text), expected, text)
 
+    def test_current_owner_recognizes_takeover(self):
+        comments = [
+            {"body": "<!-- collab:claim issue=1 member=workbuddy family=workbuddy nonce=x -->"},
+            {"body": "<!-- collab:takeover issue=1 from=workbuddy to=gemini reason=stale-60m -->"},
+        ]
+        self.assertEqual(collab.current_owner(comments), "gemini")
+
 
 class TestGate(RepoFixture):
     def test_gate_passes_and_writes_receipt(self):
