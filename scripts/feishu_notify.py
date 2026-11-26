@@ -103,9 +103,7 @@ def collect(cwd: Path, pr_filter: int | None, limit: int) -> list[tuple[dict, st
             raise SystemExit(f"PR #{pr_filter} 不存在")
         if pr.get("state") != "OPEN":
             raise SystemExit(f"PR #{pr_filter} 不是打开状态（{pr.get('state')}）")
-        stage = pr_stage(cwd, pr)
-        if not stage:
-            raise SystemExit(f"PR #{pr_filter} 未处于待终审/待合并阶段（无 review:agent-passed 或 status:ready-to-merge）")
+        stage = pr_stage(cwd, pr) or "merge"
         return [(pr, stage)]
     prs = _gh_json(
         ["pr", "list", "--state", "open", "--limit", str(limit),

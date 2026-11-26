@@ -17,10 +17,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -45,8 +45,21 @@ def _pr_url(cwd: Path, pr: int) -> str:
         return ""
 
 
+def _pr_has_collab_issue(cwd: Path, pr: int) -> bool:
+    proc = _run([gh_exe(), "pr", "view", str(pr), "--json", "body"], cwd, timeout=60)
+    if proc.returncode != 0:
+        return False
+    try:
+        body = json.loads(proc.stdout).get("body") or ""
+    except (json.JSONDecodeError, AttributeError):
+        return False
+    return bool(re.search(r"<!--\s*collab:issue=\d+\s*-->", body))
+
+
 def try_accept(cwd: Path, pr: int) -> tuple[bool, str]:
-    """尽力而为地记录人类终审（collab accept）。已通过/无该阶段时不算失败。"""
+    """尽力而为地记录人类终审（collab accept）。非 collab PR 或已通过时不算失败。"""
+    if not _pr_has_collab_issue(cwd, pr):
+        return True, "非 collab PR，跳过终审"
     cmd = [sys.executable, str(cwd / "scripts" / "collab.py"), "accept", str(pr), "--member", "human"]
     proc = _run(cmd, cwd, timeout=180)
     if proc.returncode == 0:
