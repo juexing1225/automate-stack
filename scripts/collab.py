@@ -605,7 +605,8 @@ def check_stage_eligibility(item: dict, member: str, cfg: dict, now=None, role="
         return True  # 未配置阶梯 → 不限制
     tier = item_tier(names) or routing.get("default_tier", "standard")
     # 高风险变更：审查侧自动升级为 hard 级策略（方案：risk:high 审查走 hard 阶梯）
-    if role == "review" and "risk:high" in names:
+    # 二审（_force_hard）：同样强制 hard 阶梯，仅 @elite 可接审
+    if role == "review" and ("risk:high" in names or item.get("_force_hard")):
         tier = "hard"
     spec = tiers.get(tier) or tiers.get("standard") or {}
     stages_key = "review_stages" if role == "review" else "stages"
@@ -959,9 +960,15 @@ def count_rework_verdicts(comments):
 
 
 def active_lease(comments, sha: str, member: str, lease_minutes: int):
-    """返回当前 head SHA 上「他人未过期」的 review-lease；无则 None。"""
+    """返回当前 head SHA 上「他人未过期」的 review-lease；无则 None。
+
+    若评论流中存在晚于该租约的 `collab:second-review` 且 `lease_release_for == sha`，
+    则旧 30 分钟审查租约被显式作废，返回 None（另一异族王牌可立即接审，避免被前审查员挡死）。
+    """
     now = datetime.now(timezone.utc)
-    for item in comments:
+    lease = None
+    lease_index = -1
+    for index, item in enumerate(comments):
         marker = parse_marker_dict(item.get("body") or "", "review-lease")
         if not marker or marker.get("sha", "").lower() != (sha or "").lower():
             continue
@@ -970,11 +977,114 @@ def active_lease(comments, sha: str, member: str, lease_minutes: int):
         expires = marker.get("expires_at") or ""
         try:
             expiry = datetime.fromisoformat(expires.replace("Z", "+00:00"))
-            if expiry > now:
-                return marker
         except ValueError:
             continue
-    return None
+        if expiry > now:
+            lease = marker
+            lease_index = index
+            break
+    if lease is None:
+        return None
+    # 二审显式作废：评论流中晚于该租约的 collab:second-review 且 lease_release_for == sha
+    for index in range(lease_index + 1, len(comments)):
+        marker = parse_marker_dict(comments[index].get("body") or "", "second-review")
+        if marker and (marker.get("lease_release_for") or "").lower() == (sha or "").lower():
+            return None
+    return lease
+
+
+def parse_second_reviews(comments):
+    """按出现顺序返回所有 `collab:second-review` 标记（每项为一个 dict）。"""
+    result = []
+    for item in comments:
+        marker = parse_marker_dict(item.get("body") or "", "second-review")
+        if marker:
+            result.append(marker)
+    return result
+
+
+def second_review_exclusions(comments, sha):
+    """聚合针对给定 SHA 的 collab:second-review 排除集。
+
+    返回 (exclude_members: set, exclude_families: set)；sha 不匹配的标记不参与聚合。
+    """
+    members, families = set(), set()
+    for marker in parse_second_reviews(comments):
+        if (marker.get("sha") or "").lower() != (sha or "").lower():
+            continue
+        if marker.get("exclude_member"):
+            members.add(marker["exclude_member"])
+        if marker.get("exclude_family"):
+            families.add(marker["exclude_family"])
+    return members, families
+
+
+def _parse_ts(value: str):
+    """宽松解析 ISO8601 时间戳（同时接受 Z 与 +00:00）；失败返回 None。"""
+    try:
+        return datetime.fromisoformat((value or "").strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def reset_attempts_ts(root: Path, issue_number, member: str):
+    """返回 Issue 评论中针对该 member 的最新 collab:reset-attempts 时间戳；无则 None。"""
+    latest = None
+    for item in issue_comments(root, issue_number):
+        marker = parse_marker_dict(item.get("body") or "", "reset-attempts")
+        if not marker:
+            continue
+        if marker.get("member") and marker.get("member") != member:
+            continue
+        ts = _parse_ts(marker.get("ts") or "")
+        if ts is None:
+            continue
+        if latest is None or ts > latest:
+            latest = ts
+    return latest
+
+
+def _apply_remote_attempt_reset(root: Path, member: str, issue_no: int, target_key: str):
+    """Issue 评论存在 ts 晚于本地 last_attempt_at 的 reset-attempts 时，归零本地计数。
+
+    解决跨机/多工作区无法清理另一台机器本地 attempts 计数的问题。
+    """
+    reset_ts = reset_attempts_ts(root, issue_no, member)
+    if reset_ts is None:
+        return
+    attempts = read_attempts(root, member)
+    entry = attempts.get(target_key)
+    if not entry:
+        return
+    last = _parse_ts(entry.get("last_attempt_at") or "")
+    if last is None or reset_ts > last:
+        entry["count"] = 0
+        write_atomic(attempts_dir(root) / f"{member}.json", json.dumps(attempts, ensure_ascii=False, indent=2))
+
+
+def remote_protected_approval(root: Path, pr_number, head: str, cfg: dict):
+    """校验 PR 评论中的 collab:allow-protected 远程特批是否可信（C4 信任链）。
+
+    三要素：① 评论真实 GitHub 作者 ∈ trusted_github_logins；
+    ② marker sha == 当前 HEAD；③ 非外部 Fork PR。
+    返回 (ok: bool, reason: str)。任一不满足即拒绝，且不绕过 GitHub 分支保护。
+    """
+    if not pr_number:
+        return False, "未提供 PR 号，无法核验远程特批"
+    pr = gh_json(root, ["pr", "view", str(pr_number), "--json", "number,headRefOid,isCrossRepository,comments"])
+    if pr.get("isCrossRepository"):
+        return False, "外部 Fork PR 禁止远程特批"
+    if (pr.get("headRefOid") or "").lower() != (head or "").lower():
+        return False, "远程特批对应 PR 的 head 与当前 HEAD 不一致"
+    for item in pr.get("comments") or []:
+        marker = parse_marker_dict(item.get("body") or "", "allow-protected")
+        if not marker or (marker.get("sha") or "").lower() != (head or "").lower():
+            continue
+        author = item.get("author") or {}
+        login = author.get("login", "") if isinstance(author, dict) else ""
+        if login in cfg["trusted_github_logins"]:
+            return True, ""
+    return False, "PR 评论中未找到可信作者发布的、绑定当前 SHA 的 allow-protected 特批"
 
 
 # ---------------------------------------------------------------- doctor / labels / list
@@ -1463,6 +1573,8 @@ def run_gate(
     allow_dirty=False,
     allow_protected=False,
     quiet=False,
+    check_remote_approval=False,
+    pr_number=None,
 ):
     repo = repo.resolve()
     head = rev_parse(repo, "HEAD")
@@ -1483,6 +1595,15 @@ def run_gate(
     protected_globs = list(dict.fromkeys([*CORE_PROTECTED, *cfg["protected_files"]]))
     protected = [(f, match_any(f, protected_globs)) for f in files]
     protected = [(f, g) for f, g in protected if g]
+    allow_protected_cli = allow_protected
+    protected_remote_approval = False
+    if protected and not allow_protected and check_remote_approval:
+        approved, reason = remote_protected_approval(repo, pr_number, head, cfg)
+        if approved:
+            allow_protected = True
+            protected_remote_approval = True
+        else:
+            problems.append("远程受保护文件特批未通过（" + reason + "）：\n  - " + "\n  - ".join(f for f, _ in protected))
     if protected and not allow_protected:
         problems.append("改动受保护文件（需要人放行时加 --allow-protected）：\n  - " + "\n  - ".join(f for f, _ in protected))
 
@@ -1541,7 +1662,8 @@ def run_gate(
         "ok": ok,
         "failure": failure,
         "protected_ok": not protected or allow_protected,
-        "protected_override": bool(protected and allow_protected),
+        "protected_override": bool(protected and allow_protected_cli),
+        "protected_remote_approval": protected_remote_approval,
         "secrets_ok": not secrets,
         "changed_files": files,
         "risk_files": [f for f, _ in risk],
@@ -1583,6 +1705,8 @@ def cmd_gate(args):
         role="author",
         allow_dirty=args.dirty,
         allow_protected=args.allow_protected,
+        check_remote_approval=getattr(args, "check_remote_approval", False),
+        pr_number=getattr(args, "pr", None),
     )
     if args.out:
         out_path = Path(args.out)
@@ -1930,11 +2054,21 @@ def cmd_review(args):
         )
 
     # 审查租约：他人未过期的同 SHA 租约存在时拒绝重复审查
-    lease = active_lease(pr_comments(root, args.pr), head, member, cfg["review_lease_minutes"])
+    comments = pr_comments(root, args.pr)
+    lease = active_lease(comments, head, member, cfg["review_lease_minutes"])
     if lease:
         raise Fail(
             f"PR #{args.pr} @ {head[:12]} 已被 `{lease.get('member')}` 在有效租约内审查，"
             f"避免重复消耗额度；租约到期后再接手"
+        )
+
+    # 二审排除：前审查员/同族被拒，强制换异族王牌接审（不静默降级）
+    excl_members, excl_families = second_review_exclusions(comments, head)
+    if member in excl_members or member_family in excl_families:
+        raise Fail(
+            f"PR #{args.pr} 已指定二审排除集（前审查员 {sorted(excl_members) or '无'} / "
+            f"前家族 {sorted(excl_families) or '无'}）；成员 {member}（family={member_family}）被排除，"
+            f"请换一个异族成员（@elite）接审"
         )
 
     fetched = run(["git", "fetch", "origin", f"pull/{args.pr}/head"], root, timeout=120)
@@ -2031,6 +2165,14 @@ def cmd_review_submit(args):
         raise Fail(
             f"同族审查被拒：{member}（family={member_family}）与作者家族 {author_families} 同源；"
             f"请换异族成员验收"
+        )
+
+    # 二审排除：前审查员/同族被拒（消费与 review 一致）
+    excl_members, excl_families = second_review_exclusions(pr_comments(root, args.pr), head)
+    if member in excl_members or member_family in excl_families:
+        raise Fail(
+            f"PR #{args.pr} 已指定二审排除集；成员 {member}（family={member_family}）被排除，"
+            f"请换一个异族成员（@elite）接审"
         )
 
     report_file = Path(args.file)
@@ -2163,6 +2305,10 @@ def cmd_accept(args):
     if pr.get("state") != "OPEN":
         raise Fail(f"PR #{args.pr} 不是打开状态（{pr.get('state')}）")
     head = pr.get("headRefOid", "")
+    if getattr(args, "sha", None):
+        sha = args.sha.strip()
+        if sha.lower() != head.lower():
+            raise Fail(f"过期终审：--sha {sha[:12]} ≠ PR 当前 head {head[:12]}；发卡后 PR 又更新，请重新取 head 再终审")
 
     issue_no = parse_marker(pr.get("body") or "", "issue")
     if not issue_no or not issue_no.isdigit():
@@ -2349,6 +2495,8 @@ def cmd_next(args):
 
     def pick(target_key, issue_no, build):
         nonlocal result
+        # 跨机无进展熔断重置：Issue 评论存在 ts 晚于本地 last_attempt_at 的 reset-attempts 时归零
+        _apply_remote_attempt_reset(root, member, issue_no, target_key)
         if read_attempts(root, member).get(target_key, {}).get("count", 0) >= cfg["max_attempts_per_target"]:
             fuse_issue(root, issue_no, member, target_key, cfg["max_attempts_per_target"])
             return False
@@ -2438,13 +2586,19 @@ def cmd_next(args):
                         if cfg["require_cross_family_review"] and member_family in author_families:
                             continue
                         head_sha = pr.get("headRefOid", "")
-                        if active_lease(pr_comments(root, pr["number"]), head_sha, member, cfg["review_lease_minutes"]):
+                        pr_cmts = pr_comments(root, pr["number"])
+                        if active_lease(pr_cmts, head_sha, member, cfg["review_lease_minutes"]):
+                            continue
+                        excl_members, excl_families = second_review_exclusions(pr_cmts, head_sha)
+                        if member in excl_members or member_family in excl_families:
                             continue
                         review_item = {
                             "labels": [{"name": n} for n in names],
                             "body": issue_body,
                             "updatedAt": pr.get("updatedAt") or pr.get("createdAt"),
                         }
+                        if excl_members or excl_families:
+                            review_item["_force_hard"] = True
                         if not check_stage_eligibility(review_item, member, cfg, role="review"):
                             continue
                         pr_no = pr["number"]
@@ -2517,13 +2671,19 @@ def cmd_next(args):
             if cfg["require_cross_family_review"] and member_family in author_families:
                 continue
             head_sha = pr.get("headRefOid", "")
-            if active_lease(pr_comments(root, pr["number"]), head_sha, member, cfg["review_lease_minutes"]):
+            pr_cmts = pr_comments(root, pr["number"])
+            if active_lease(pr_cmts, head_sha, member, cfg["review_lease_minutes"]):
+                continue
+            excl_members, excl_families = second_review_exclusions(pr_cmts, head_sha)
+            if member in excl_members or member_family in excl_families:
                 continue
             review_item = {
                 "labels": [{"name": n} for n in names],
                 "body": issue_body,
                 "updatedAt": pr.get("updatedAt") or pr.get("createdAt"),
             }
+            if excl_members or excl_families:
+                review_item["_force_hard"] = True
             if not check_stage_eligibility(review_item, member, cfg, role="review"):
                 continue
             pr_no = pr["number"]
@@ -2694,6 +2854,8 @@ def build_parser():
     p.add_argument("--profile", choices=PROFILES, default="fast")
     p.add_argument("--dirty", action="store_true", help="允许脏工作区（仅自测，回执不能交单）")
     p.add_argument("--allow-protected", action="store_true", help="人放行受保护文件")
+    p.add_argument("--check-remote-approval", action="store_true", help="联网核验 PR 评论中的 allow-protected 远程特批（C4 信任链）")
+    p.add_argument("--pr", type=int, help="配合 --check-remote-approval 使用的 PR 号")
     p.add_argument("--out", help="回执副本路径")
     p.set_defaults(func=cmd_gate)
 
@@ -2729,6 +2891,7 @@ def build_parser():
     p.add_argument("--member", required=True, help="终审人 member ID（人类）")
     p.add_argument("--family", default=argparse.SUPPRESS, help="多模型宿主临时家族覆写（如 antigravity --family claude）")
     p.add_argument("--allow-same-family", action="store_true", help="单模型紧急降级：允许同族 PASS 终审（留痕）")
+    p.add_argument("--sha", help="期望的 PR head SHA；不匹配即拒绝（发卡后 PR 又更新则防漂移）")
     p.set_defaults(func=cmd_accept)
 
     p = sub.add_parser("pack", help="导出网页成员用的任务包/审单包")
