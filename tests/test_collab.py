@@ -977,7 +977,12 @@ V26_ROUTING = {
 
 
 def v26_cfg():
-    return {"members": V26_MEMBERS, "routing": V26_ROUTING, "families": {}}
+    return {
+        "members": V26_MEMBERS,
+        "routing": V26_ROUTING,
+        "families": {},
+        "multi_model_hosts": ["antigravity", "workbuddy", "workbuddy-ai"],
+    }
 
 
 class TestV26(unittest.TestCase):
@@ -1018,6 +1023,29 @@ class TestV26(unittest.TestCase):
         self.assertTrue(collab.check_stage_eligibility(basic, "baizhi", cfg, now=now, role="review"))
         self.assertTrue(collab.check_stage_eligibility(basic, "qianwen", cfg, now=now, role="review"))
 
+    def test_family_override_multi_model_host(self):
+        cfg = v26_cfg()
+        # 多模型宿主可覆写家族
+        self.assertEqual(collab.resolve_family("antigravity", cfg, "claude"), "claude")
+        self.assertEqual(collab.resolve_family("antigravity", cfg), "gemini")
+        # 非多模型宿主覆写被拒（防绕过异族校验）
+        with self.assertRaises(collab.Fail):
+            collab.resolve_family("dsh", cfg, "claude")
+
+    def test_dispatch_preference_only_and_prefer(self):
+        cfg = v26_cfg()
+        now = collab.datetime(2026, 11, 26, 17, 0, 0, tzinfo=collab.timezone.utc)
+        # 仅限：gpt 严格锁定，其他成员永久不可领
+        only_body = "## 派单偏好\n仅限：gpt\n"
+        hard = {"labels": [{"name": "tier:hard"}], "createdAt": now.isoformat(), "body": only_body}
+        self.assertTrue(collab.check_stage_eligibility(hard, "gpt", cfg, now=now, role="dev"))
+        self.assertFalse(collab.check_stage_eligibility(hard, "gemini", cfg, now=now, role="dev"))
+        self.assertFalse(collab.check_stage_eligibility(hard, "baizhi", cfg, now=now, role="dev"))
+        # 优先：baizhi 0 分钟抢跑
+        prefer_body = "## 派单偏好\n优先：baizhi\n"
+        basic = {"labels": [{"name": "tier:basic"}], "createdAt": now.isoformat(), "body": prefer_body}
+        self.assertTrue(collab.check_stage_eligibility(basic, "baizhi", cfg, now=now, role="dev"))
+
 
 class TestV26Proxy(RepoFixture):
     def setUp(self):
@@ -1041,6 +1069,39 @@ class TestV26Proxy(RepoFixture):
         self.assertIn("collab:authors=qianwen", body)
         self.assertIn("collab:families=qwen", body)
         self.assertIn("submit-proxy=true", body)
+
+
+class TestV26Takeover(RepoFixture):
+    def setUp(self):
+        super().setUp()
+        cfg = json.loads((self.repo / ".collab" / "config.json").read_text(encoding="utf-8"))
+        cfg["members"] = V26_MEMBERS
+        cfg["routing"] = V26_ROUTING
+        cfg["families"] = {}
+        cfg["stale_takeover_minutes"] = 60
+        (self.repo / ".collab" / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "v26 config")
+
+    def test_next_takeover_stale_free_pool(self):
+        # 免费池成员 workbuddy 的在制单静默超时，由 fallback 梯队 gemini 接管
+        issue = self.owned_issue(2, "status:in-progress", "workbuddy")
+        issue["updatedAt"] = "2026-11-25T00:00:00Z"
+        self.write_state({"issues": {"2": issue}, "pr": None, "prs": []})
+        p = run_tool(self.repo, "next", "--member", "gemini", "--json", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        data = json.loads(p.stdout)
+        self.assertEqual(data["action"], "takeover_in_progress")
+        self.assertEqual(data["issue"], 2)
+
+    def test_next_no_takeover_when_fresh(self):
+        # 未超时的在制单不应被接管
+        issue = self.owned_issue(2, "status:in-progress", "workbuddy")
+        issue["updatedAt"] = collab.now_iso()
+        self.write_state({"issues": {"2": issue}, "pr": None, "prs": []})
+        p = run_tool(self.repo, "next", "--member", "gemini", "--json", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertEqual(json.loads(p.stdout)["action"], "idle")
 
 
 if __name__ == "__main__":

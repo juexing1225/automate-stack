@@ -81,6 +81,8 @@ DEFAULT_CONFIG = {
     "max_attempts_per_target": 2,
     "review_lease_minutes": 30,
     "active_session_minutes": 30,
+    "stale_takeover_minutes": 60,
+    "multi_model_hosts": ["antigravity", "workbuddy", "workbuddy-ai"],
     "families": {
         "antigravity": "gemini",
         "gemini": "gemini",
@@ -272,11 +274,14 @@ def validate_config(cfg: dict) -> None:
     for key in ("trusted_github_logins",):
         if not isinstance(cfg.get(key), list) or not all(isinstance(x, str) for x in cfg[key]):
             raise Fail(f"配置错误：{key} 必须是字符串数组")
-    for key in ("max_wip_per_member", "max_rework_rounds", "max_attempts_per_target", "review_lease_minutes", "active_session_minutes"):
+    for key in ("max_wip_per_member", "max_rework_rounds", "max_attempts_per_target", "review_lease_minutes", "active_session_minutes", "stale_takeover_minutes"):
         if not isinstance(cfg.get(key), int) or cfg[key] < 1:
             raise Fail(f"配置错误：{key} 必须是正整数")
     if not isinstance(cfg.get("require_cross_family_review"), bool):
         raise Fail("配置错误：require_cross_family_review 必须是布尔值")
+    multi_hosts = cfg.get("multi_model_hosts")
+    if not isinstance(multi_hosts, list) or not all(isinstance(x, str) for x in multi_hosts):
+        raise Fail("配置错误：multi_model_hosts 必须是字符串数组")
     families = cfg.get("families")
     if not isinstance(families, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in families.items()):
         raise Fail("配置错误：families 必须是字符串到字符串的映射")
@@ -430,8 +435,28 @@ def resolve_member_entry(member: str, cfg: dict):
     return None
 
 
-def resolve_family(member: str, cfg: dict) -> str:
-    """把 member 解析到底层模型/产品家族；未登记成员失败关闭（禁匿名绕过异族校验）。"""
+def is_multi_model_host(member: str, cfg: dict) -> bool:
+    key = (member or "").strip().lower()
+    hosts = [h.lower() for h in (cfg.get("multi_model_hosts") or [])]
+    if key in hosts:
+        return True
+    prefix = re.split(r"[-:]", key, maxsplit=1)[0]
+    return bool(prefix and prefix in hosts)
+
+
+def resolve_family(member: str, cfg: dict, family_override: str | None = None) -> str:
+    """把 member 解析到底层模型/产品家族；未登记成员失败关闭（禁匿名绕过异族校验）。
+
+    family_override（来自 --family / COLLAB_FAMILY）：仅多模型宿主可临时覆写家族，
+    防止普通成员改名绕过异族交叉审查。
+    """
+    override = (family_override or os.environ.get("COLLAB_FAMILY") or "").strip().lower()
+    if override:
+        if not is_multi_model_host(member, cfg):
+            raise Fail(f"成员 `{member}` 不是多模型宿主，不允许覆写家族（防绕过异族校验）")
+        if not re.fullmatch(r"[a-z0-9_-]+", override):
+            raise Fail("家族覆写必须是合法标识符（小写字母/数字/连字符/下划线）")
+        return override
     entry = resolve_member_entry(member, cfg)
     if entry and entry.get("family"):
         return entry["family"]
@@ -450,14 +475,28 @@ def resolve_pools(member: str, cfg: dict):
     return [p for p in pools if isinstance(p, str)]
 
 
-def parse_prefer(body: str):
-    """解析 Issue 正文 `## 派单偏好`，返回偏好 token 列表（如 qianwen / @elite / qwen）。"""
+def _split_targets(text: str):
+    return [t.strip().lower() for t in re.split(r"[，,、\s]+", (text or "")) if t.strip()]
+
+
+def parse_dispatch_preference(body: str):
+    """解析 Issue 正文 `## 派单偏好`，返回 (mode, targets)。
+
+    mode：None（未指定）/ "only"（仅限，严格锁定）/ "prefer"（优先，0 分钟抢跑后走阶梯兜底）。
+    """
     sec = section(body or "", "派单偏好")
     if sec is None:
-        return []
-    text = strip_comments(sec)
-    tokens = re.findall(r"@?[A-Za-z][\w.-]*", text)
-    return tokens
+        return None, []
+    text = strip_comments(sec).strip()
+    if not text:
+        return None, []
+    m = re.search(r"(?:仅限|only)\s*[:：]\s*(.+)", text, re.I)
+    if m:
+        return "only", _split_targets(m.group(1))
+    m = re.search(r"(?:优先|prefer)\s*[:：]\s*(.+)", text, re.I)
+    if m:
+        return "prefer", _split_targets(m.group(1))
+    return "prefer", _split_targets(text)
 
 
 def item_tier(names) -> str:
@@ -467,22 +506,20 @@ def item_tier(names) -> str:
     return ""
 
 
-def prefer_target(names, body=""):
-    """从标签 prefer:<x> 与正文「派单偏好」返回偏好 token 集合。"""
+def prefer_target(names):
+    """从标签 prefer:<x> 返回偏好 token 集合（label 点将，保留 V2.6 兼容）。"""
     prefers = set()
     for name in names:
         if name.startswith("prefer:"):
             prefers.add(name[len("prefer:"):].strip().lower())
-    for token in parse_prefer(body):
-        prefers.add(token.lower())
     return prefers
 
 
-def prefer_matches(prefers, member: str, family: str, pools) -> bool:
-    if not prefers:
+def _target_matches(targets, member: str, family: str, pools) -> bool:
+    if not targets:
         return False
     member = member.strip().lower()
-    for token in prefers:
+    for token in targets:
         if token == member or token == family:
             return True
         if token.startswith("@"):
@@ -521,9 +558,17 @@ def check_stage_eligibility(item: dict, member: str, cfg: dict, now=None, role="
     family = entry.get("family", "")
     pools = resolve_pools(member, cfg)
     names = label_names(item)
-    # prefer 点将优先级最高，命中即放行
-    if prefer_matches(prefer_target(names, item.get("body") or ""), member, family, pools):
+    body = item.get("body") or ""
+    # 1) 正文「仅限」严格锁定：除列表外永久不可领
+    mode, targets = parse_dispatch_preference(body)
+    if mode == "only":
+        return _target_matches(targets, member, family, pools)
+    # 2) 正文「优先」/ 标签 prefer 点将：0 分钟抢跑
+    if mode == "prefer" and _target_matches(targets, member, family, pools):
         return True
+    if _target_matches(prefer_target(names), member, family, pools):
+        return True
+    # 3) 按 tier 阶梯时间窗
     routing = cfg.get("routing") or {}
     tiers = routing.get("tiers") or {}
     if not tiers:
@@ -556,6 +601,45 @@ def issue_fallback_now(root: Path, issue_no: int) -> bool:
         if marker and marker.get("fallback") == "now":
             return True
     return False
+
+
+def free_pool_members(cfg: dict):
+    """返回注册表中 pools 含 free 的成员 ID 列表（免费池）。"""
+    members = cfg.get("members") or {}
+    return [mid for mid, entry in members.items() if "free" in (entry.get("pools") or [])]
+
+
+def is_free_pool_member(member: str, cfg: dict) -> bool:
+    return (member or "").strip().lower() in [m.lower() for m in free_pool_members(cfg)]
+
+
+def find_stale_takeover(root: Path, cfg: dict, member: str, now=None):
+    """返回可被当前成员接管的静默超时免费池单 (issue, action)，无则 None。
+
+    条件：单在 status:in-progress/rework、无 blocked:*、归属免费池成员、当前成员非免费池、
+    WIP 未满、且距最后活跃超过 stale_takeover_minutes。
+    """
+    now = now or datetime.now(timezone.utc)
+    if is_free_pool_member(member, cfg):
+        return None
+    wip = len(member_owned_issues(root, cfg, member, "status:in-progress")) + \
+          len(member_owned_issues(root, cfg, member, "status:rework"))
+    if wip >= cfg["max_wip_per_member"]:
+        return None
+    for issue in list_issues(root):
+        names = label_names(issue)
+        if "status:in-progress" not in names and "status:rework" not in names:
+            continue
+        if any(n.startswith("blocked:") for n in names):
+            continue
+        owner = current_owner(issue_comments(root, issue["number"]))
+        if not owner or not is_free_pool_member(owner, cfg):
+            continue
+        if _elapsed_minutes(issue, now) < cfg["stale_takeover_minutes"]:
+            continue
+        action = "takeover_rework" if "status:rework" in names else "takeover_in_progress"
+        return issue, action
+    return None
 
 
 def match_any(path: str, patterns) -> str:
@@ -1049,7 +1133,7 @@ def member_wip(root: Path, cfg: dict, member: str):
 def cmd_claim(args):
     root, cfg = context(args)
     member = require_member(args.member)
-    member_family = resolve_family(member, cfg)
+    member_family = resolve_family(member, cfg, getattr(args, "family", "") or None)
 
     issue = gh_json(
         root,
@@ -1078,7 +1162,7 @@ def cmd_claim(args):
     if issue_fallback_now(root, args.issue):
         issue["_fallback_now"] = True
     if not check_stage_eligibility(issue, member, cfg, role="dev"):
-        family = resolve_family(member, cfg)
+        family = resolve_family(member, cfg, getattr(args, "family", "") or None)
         raise Fail(
             f"成员 {member}（family={family}）当前不在本单的算力池白名单时间窗内；"
             f"等阶梯解锁（满相应分钟）或由更高档池成员补位"
@@ -1208,7 +1292,7 @@ def cmd_claim(args):
 def cmd_release(args):
     root, cfg = context(args)
     member = require_member(args.member)
-    resolve_family(member, cfg)
+    resolve_family(member, cfg, getattr(args, "family", "") or None)
     reason = (args.reason or "").strip()
     if not reason:
         raise Fail("--reason 必须写清退单原因")
@@ -1487,7 +1571,7 @@ def cmd_submit(args):
     if receipt.get("config_sha256") != config_sha256(root):
         raise Fail("回执绑定的 .collab/config.json 与当前配置不一致；配置被改过，重新跑 gate")
 
-    resolve_family(member, cfg)  # 未登记成员失败关闭
+    resolve_family(member, cfg, getattr(args, "family", "") or None)  # 未登记成员失败关闭
     authors = [member]
     for extra in args.co_author or []:
         extra = require_member(extra)
@@ -1708,7 +1792,7 @@ def cmd_review(args):
         raise Fail(f"不能验收自己参与的作品：{member} ∈ 作者集合 {authors}")
 
     # 异族硬校验：审查者家族不得落在作者家族集合
-    member_family = resolve_family(member, cfg)
+    member_family = resolve_family(member, cfg, getattr(args, "family", "") or None)
     author_families = parse_families(pr.get("body") or "")
     if cfg["require_cross_family_review"] and member_family in author_families:
         raise Fail(
@@ -1812,7 +1896,7 @@ def cmd_review_submit(args):
     if member in authors:
         raise Fail(f"不能验收自己参与的作品：{member} ∈ 作者集合 {authors}")
 
-    member_family = resolve_family(member, cfg)
+    member_family = resolve_family(member, cfg, getattr(args, "family", "") or None)
     author_families = parse_families(pr.get("body") or "")
     if cfg["require_cross_family_review"] and member_family in author_families:
         raise Fail(
@@ -2077,7 +2161,7 @@ def _emit(result: dict, args) -> int:
 def cmd_next(args):
     root, cfg = context(args)
     member = require_member(args.member)
-    member_family = resolve_family(member, cfg)
+    member_family = resolve_family(member, cfg, getattr(args, "family", "") or None)
     role = (getattr(args, "role", "any") or "any").lower()
 
     # 1) 防重入锁：距上次心跳不足 active_session_minutes 则 busy
@@ -2236,6 +2320,22 @@ def cmd_next(args):
                                     }
                                 if pick(key, issue_no, build_claim):
                                     break
+        # P1.5 接管（P1-P4 均未命中时评估）：免费池成员静默超时由备选梯队接管
+        if result["action"] == "idle":
+            takeover = find_stale_takeover(root, cfg, member, now)
+            if takeover is not None:
+                t_issue, t_action = takeover
+                t_no = t_issue["number"]
+
+                def build_takeover(issue=t_issue, issue_no=t_no, action=t_action):
+                    return {
+                        "action": action, "member": member, "family": member_family,
+                        "issue": issue_no, "pr": None, "head_sha": None,
+                        "worktree": f"{cfg['worktree_root']}/issue-{issue_no}",
+                        "rework_file": None,
+                        "reason": f"P1.5：接管免费池静默超时单 #{issue_no}（原成员断粮超 {cfg['stale_takeover_minutes']} 分钟）",
+                    }
+                pick(f"issue#{t_no}@takeover", t_no, build_takeover)
     elif role == "review":
         # 仅看 P3
         for pr in list_prs(root):
@@ -2394,6 +2494,7 @@ def build_parser():
     )
     parser.add_argument("--repo", default=".", help="仓库路径（默认当前目录）")
     parser.add_argument("--version", action="version", version=f"collab.py {TOOL_VERSION}")
+    parser.add_argument("--family", default="", help="多模型宿主临时家族覆写（如 antigravity --family claude）")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("doctor", help="体检仓库、配置、标签、gh")

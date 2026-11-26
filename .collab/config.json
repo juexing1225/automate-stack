@@ -12,48 +12,162 @@
   "review_lease_minutes": 30,
   "active_session_minutes": 30,
   "members": {
-    "baizhi": {"family": "baizhi", "pools": ["free"]},
-    "ohmyagent": {"family": "baizhi", "pools": ["free"]},
-    "qianwen": {"family": "qwen", "pools": ["free"]},
-    "workbuddy": {"family": "workbuddy", "pools": ["free"]},
-    "workbuddy-ai": {"family": "workbuddy", "pools": ["free"]},
-    "dsh": {"family": "deepseek", "pools": ["abundant"]},
-    "gemini": {"family": "gemini", "pools": ["abundant", "elite"]},
-    "antigravity": {"family": "gemini", "pools": ["elite"]},
-    "antigravity-claude": {"family": "claude", "pools": ["elite"]},
-    "gpt": {"family": "openai", "pools": ["elite"]},
-    "human": {"family": "human", "pools": ["human"]}
+    "baizhi": {
+      "family": "baizhi",
+      "pools": [
+        "free"
+      ]
+    },
+    "ohmyagent": {
+      "family": "baizhi",
+      "pools": [
+        "free"
+      ]
+    },
+    "qianwen": {
+      "family": "qwen",
+      "pools": [
+        "free"
+      ]
+    },
+    "workbuddy": {
+      "family": "workbuddy",
+      "pools": [
+        "free"
+      ]
+    },
+    "workbuddy-ai": {
+      "family": "workbuddy",
+      "pools": [
+        "free"
+      ]
+    },
+    "dsh": {
+      "family": "deepseek",
+      "pools": [
+        "abundant"
+      ]
+    },
+    "gemini": {
+      "family": "gemini",
+      "pools": [
+        "abundant",
+        "elite"
+      ]
+    },
+    "antigravity": {
+      "family": "gemini",
+      "pools": [
+        "elite"
+      ]
+    },
+    "antigravity-claude": {
+      "family": "claude",
+      "pools": [
+        "elite"
+      ]
+    },
+    "gpt": {
+      "family": "openai",
+      "pools": [
+        "elite"
+      ]
+    },
+    "human": {
+      "family": "human",
+      "pools": [
+        "human"
+      ]
+    }
   },
   "routing": {
     "default_tier": "standard",
     "tiers": {
       "basic": {
         "stages": [
-          {"after_minutes": 0, "allow": ["@free"]},
-          {"after_minutes": 15, "allow": ["@abundant"]}
+          {
+            "after_minutes": 0,
+            "allow": [
+              "@free"
+            ]
+          },
+          {
+            "after_minutes": 15,
+            "allow": [
+              "@abundant"
+            ]
+          }
         ],
         "review_stages": [
-          {"after_minutes": 0, "allow": ["@free", "@abundant"]},
-          {"after_minutes": 30, "allow": ["@elite"]}
+          {
+            "after_minutes": 0,
+            "allow": [
+              "@free",
+              "@abundant"
+            ]
+          },
+          {
+            "after_minutes": 30,
+            "allow": [
+              "@elite"
+            ]
+          }
         ]
       },
       "standard": {
         "stages": [
-          {"after_minutes": 0, "allow": ["@free"]},
-          {"after_minutes": 15, "allow": ["@abundant"]},
-          {"after_minutes": 45, "allow": ["@elite"]}
+          {
+            "after_minutes": 0,
+            "allow": [
+              "@free"
+            ]
+          },
+          {
+            "after_minutes": 15,
+            "allow": [
+              "@abundant"
+            ]
+          },
+          {
+            "after_minutes": 45,
+            "allow": [
+              "@elite"
+            ]
+          }
         ],
         "review_stages": [
-          {"after_minutes": 0, "allow": ["@abundant", "@free", "@elite"]}
+          {
+            "after_minutes": 0,
+            "allow": [
+              "@abundant",
+              "@free",
+              "@elite"
+            ]
+          }
         ]
       },
       "hard": {
         "stages": [
-          {"after_minutes": 0, "allow": ["@elite"]}
+          {
+            "after_minutes": 0,
+            "allow": [
+              "@elite"
+            ]
+          }
         ],
         "review_stages": [
-          {"after_minutes": 0, "allow": ["@elite"]},
-          {"after_minutes": 15, "allow": ["@abundant"]}
+          {
+            "after_minutes": 0,
+            "allow": [
+              "@elite"
+            ]
+          },
+          {
+            "after_minutes": 15,
+            "allow": [
+              "@abundant"
+            ]
+          }
         ]
       }
     }
@@ -103,5 +217,11 @@
     "timeout_seconds": 1800,
     "submit_profile": "fast",
     "review_profile": "fast"
-  }
+  },
+  "stale_takeover_minutes": 60,
+  "multi_model_hosts": [
+    "antigravity",
+    "workbuddy",
+    "workbuddy-ai"
+  ]
 }
