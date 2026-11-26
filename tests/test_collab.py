@@ -25,6 +25,14 @@ sys.path.insert(0, str(ROOT / "scripts"))
 import collab  # noqa: E402
 
 
+def _mkdir(path: Path):
+    """mkdir -p，容忍某些宿主 Python 沙盒 shim 对 exist_ok 的破坏。"""
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except FileExistsError:
+        pass
+
+
 def git(repo, *args, check=True):
     p = subprocess.run(["git", *args], cwd=str(repo), text=True, capture_output=True)
     if check and p.returncode != 0:
@@ -151,10 +159,10 @@ class RepoFixture(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="collab-test-"))
         self.repo = self.tmp / "repo"
-        self.repo.mkdir()
+        _mkdir(self.repo)
         shutil.copytree(ROOT / "scripts", self.repo / "scripts")
-        (self.repo / ".collab").mkdir()
-        (self.repo / "docs").mkdir()
+        _mkdir(self.repo / ".collab")
+        _mkdir(self.repo / "docs")
         (self.repo / "docs" / "ARCHITECTURE.md").write_text("# Arch\n\nstable\n", encoding="utf-8")
         (self.repo / "check.py").write_text("import sys\nsys.exit(0)\n", encoding="utf-8")
         config = {
@@ -281,13 +289,13 @@ class RepoFixture(unittest.TestCase):
     def _prepare_branch(self):
         self.make_origin()
         git(self.repo, "checkout", "-q", "-b", "work/issue-1")
-        (self.repo / "src").mkdir()
+        _mkdir(self.repo / "src")
         (self.repo / "src" / "app.py").write_text("print('hi')\n", encoding="utf-8")
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "-q", "-m", "feat: app")
         run_tool(self.repo, "doctor", "--fix")
         base = git(self.repo, "rev-parse", "main")
-        (self.repo / ".collab").mkdir(exist_ok=True)
+        _mkdir(self.repo / ".collab")
         (self.repo / ".collab" / "task.md").write_text(
             f"# Issue #1: Test issue 1\n\n<!-- collab:issue=1 -->\n<!-- collab:base={base} -->\n",
             encoding="utf-8",
@@ -382,7 +390,7 @@ class TestGate(RepoFixture):
 
     def test_gate_allows_fixture_secret_outside_scan(self):
         fixture = self.repo / "tests" / "fixtures"
-        fixture.mkdir(parents=True)
+        _mkdir(fixture)
         (fixture / "fake.pem").write_text("-----BEGIN PRIVATE KEY-----\nnot real\n", encoding="utf-8")
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "-q", "-m", "fixture")
@@ -396,7 +404,7 @@ class TestGate(RepoFixture):
         self.assertIn("工作区不干净", p.stdout)
 
     def test_gate_marks_risk_files(self):
-        (self.repo / "src" / "core").mkdir(parents=True)
+        _mkdir(self.repo / "src" / "core")
         (self.repo / "src" / "core" / "a.py").write_text("x = 1\n", encoding="utf-8")
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "-q", "-m", "core change")
@@ -603,7 +611,7 @@ class TestFlow(RepoFixture):
         self.make_origin()
         old_base = git(self.repo, "rev-parse", "main")
         git(self.repo, "checkout", "-q", "-b", "work/issue-1")
-        (self.repo / ".collab").mkdir(exist_ok=True)
+        _mkdir(self.repo / ".collab")
         (self.repo / ".collab" / "task.md").write_text(
             f"# Issue #1: Test\n\n<!-- collab:issue=1 -->\n<!-- collab:base={old_base} -->\n",
             encoding="utf-8",
@@ -901,11 +909,11 @@ class TestV23(RepoFixture):
     def test_submit_fails_close_when_existing_pr_loses_authors(self):
         self.make_origin()
         git(self.repo, "checkout", "-q", "-b", "work/issue-1")
-        (self.repo / "src").mkdir(exist_ok=True)
+        _mkdir(self.repo / "src")
         (self.repo / "src" / "app.py").write_text("print(1)\n", encoding="utf-8")
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "-q", "-m", "feat")
-        (self.repo / ".collab").mkdir(exist_ok=True)
+        _mkdir(self.repo / ".collab")
         (self.repo / ".collab" / "task.md").write_text("# Issue #1\n\n<!-- collab:issue=1 -->\n", encoding="utf-8")
         p = run_tool(self.repo, "gate", "--profile", "fast")
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
