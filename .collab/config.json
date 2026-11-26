@@ -1,0 +1,227 @@
+{
+  "schema": 2,
+  "default_branch": "main",
+  "worktree_root": ".collab/worktrees",
+  "require_cross_family_review": true,
+  "trusted_github_logins": [
+    "juexing1225"
+  ],
+  "max_wip_per_member": 1,
+  "max_rework_rounds": 3,
+  "max_attempts_per_target": 2,
+  "review_lease_minutes": 30,
+  "active_session_minutes": 30,
+  "members": {
+    "baizhi": {
+      "family": "baizhi",
+      "pools": [
+        "free"
+      ]
+    },
+    "ohmyagent": {
+      "family": "baizhi",
+      "pools": [
+        "free"
+      ]
+    },
+    "qianwen": {
+      "family": "qwen",
+      "pools": [
+        "free"
+      ]
+    },
+    "workbuddy": {
+      "family": "workbuddy",
+      "pools": [
+        "free"
+      ]
+    },
+    "workbuddy-ai": {
+      "family": "workbuddy",
+      "pools": [
+        "free"
+      ]
+    },
+    "dsh": {
+      "family": "deepseek",
+      "pools": [
+        "abundant"
+      ]
+    },
+    "gemini": {
+      "family": "gemini",
+      "pools": [
+        "abundant",
+        "elite"
+      ]
+    },
+    "antigravity": {
+      "family": "gemini",
+      "pools": [
+        "elite"
+      ]
+    },
+    "antigravity-claude": {
+      "family": "claude",
+      "pools": [
+        "elite"
+      ]
+    },
+    "gpt": {
+      "family": "openai",
+      "pools": [
+        "elite"
+      ]
+    },
+    "human": {
+      "family": "human",
+      "pools": [
+        "human"
+      ]
+    }
+  },
+  "routing": {
+    "default_tier": "standard",
+    "tiers": {
+      "basic": {
+        "stages": [
+          {
+            "after_minutes": 0,
+            "allow": [
+              "@free"
+            ]
+          },
+          {
+            "after_minutes": 15,
+            "allow": [
+              "@abundant"
+            ]
+          }
+        ],
+        "review_stages": [
+          {
+            "after_minutes": 0,
+            "allow": [
+              "@free",
+              "@abundant"
+            ]
+          },
+          {
+            "after_minutes": 30,
+            "allow": [
+              "@elite"
+            ]
+          }
+        ]
+      },
+      "standard": {
+        "stages": [
+          {
+            "after_minutes": 0,
+            "allow": [
+              "@free"
+            ]
+          },
+          {
+            "after_minutes": 15,
+            "allow": [
+              "@abundant"
+            ]
+          },
+          {
+            "after_minutes": 45,
+            "allow": [
+              "@elite"
+            ]
+          }
+        ],
+        "review_stages": [
+          {
+            "after_minutes": 0,
+            "allow": [
+              "@abundant",
+              "@free",
+              "@elite"
+            ]
+          }
+        ]
+      },
+      "hard": {
+        "stages": [
+          {
+            "after_minutes": 0,
+            "allow": [
+              "@elite"
+            ]
+          }
+        ],
+        "review_stages": [
+          {
+            "after_minutes": 0,
+            "allow": [
+              "@elite"
+            ]
+          },
+          {
+            "after_minutes": 15,
+            "allow": [
+              "@abundant"
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "protected_files": [
+    "docs/ARCHITECTURE.md",
+    "scripts/collab.py",
+    "scripts/gate.sh",
+    ".collab/config.json",
+    ".github/workflows/**",
+    ".github/ISSUE_TEMPLATE/**"
+  ],
+  "review_highlight_globs": [
+    "engine/**",
+    "kits/**",
+    "**/*.json",
+    "**/*.sh"
+  ],
+  "secret_globs": [
+    ".env",
+    ".env.*",
+    "*.pem",
+    "**/*.pem",
+    "*.p12",
+    "**/*.p12",
+    "*.key",
+    "**/*.key",
+    "id_rsa*",
+    "**/id_rsa*",
+    "credentials*.json",
+    "**/credentials*.json"
+  ],
+  "secret_exclude": [
+    "**/*.example",
+    "**/*.sample",
+    "**/testdata/**",
+    "**/fixtures/**"
+  ],
+  "gate": {
+    "fast": [
+      "python3 engine/build.py"
+    ],
+    "full": [
+      "python3 engine/build.py",
+      "python3 kits/build_kits.py"
+    ],
+    "timeout_seconds": 1800,
+    "submit_profile": "fast",
+    "review_profile": "fast"
+  },
+  "stale_takeover_minutes": 60,
+  "multi_model_hosts": [
+    "antigravity",
+    "workbuddy",
+    "workbuddy-ai"
+  ]
+}
