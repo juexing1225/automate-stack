@@ -532,7 +532,7 @@ class TestMisc(RepoFixture):
             self.assertFalse(collab.remote_protected_approved(self.repo, 1, "b" * 40, cfg))
 
     def test_reset_attempts_if_requested(self):
-        # G1-05：Issue 有 ts 晚于本地 last_attempt_at 的 reset 标记 → 归零本地计数
+        # G1-05：Issue 有 ts 晚于本地 last_attempt_at 的 reset 标记 → 仅归零目标工单计数
         path = collab.attempts_dir(self.repo) / "alice.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"issue#1@rework": {"count": 2, "last_attempt_at": "2026-11-26T00:00:00+00:00"}}))
@@ -541,7 +541,8 @@ class TestMisc(RepoFixture):
         self.write_state({"issues": {"1": issue}, "pr": None, "prs": []})
         with unittest.mock.patch.dict(os.environ, self.env):
             collab.reset_attempts_if_requested(self.repo, "alice", 1)
-        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {})
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["issue#1@rework"]["count"], 0)
 
 
 class TestFlow(RepoFixture):
@@ -1248,6 +1249,194 @@ class TestV26Takeover(RepoFixture):
         p = run_tool(self.repo, "next", "--member", "gemini", "--json", env=self.env)
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
         self.assertEqual(json.loads(p.stdout)["action"], "idle")
+
+
+class TestRectificationR1(unittest.TestCase):
+    """R1：受保护文件 SHA 特批在来源确认失败时必须 fail-closed 拒绝。"""
+
+    def _cfg(self):
+        return {"trusted_github_logins": ["fake-gh-user"]}
+
+    def _approving_comments(self, root, pr_number):
+        head = "a" * 40
+        return [{
+            "body": f"<!-- collab:allow-protected pr=1 sha={head} operator=x via=feishu -->",
+            "author": {"login": "fake-gh-user"},
+        }]
+
+    def test_remote_approved_fail_closed(self):
+        head = "a" * 40
+        cfg = self._cfg()
+        # 即使评论侧有白名单作者 + 正确 sha，只要来源核验失败/异常/字段缺失/类型错误/Fork 就拒绝
+        cases = [
+            ("", 1),                                # 请求失败
+            ("not-json", 0),                        # 非法 JSON
+            ("{}", 0),                              # 字段缺失
+            ('{"isCrossRepository": null}', 0),     # null
+            ('{"isCrossRepository": "false"}', 0),  # 类型错误（字符串）
+            ('{"isCrossRepository": true}', 0),     # 明确 Fork
+        ]
+        for stdout, code in cases:
+            with mock.patch.object(collab, "pr_comments", side_effect=self._approving_comments):
+                p = mock.Mock(returncode=code, stdout=stdout)
+                with mock.patch.object(collab, "gh", return_value=p):
+                    self.assertFalse(
+                        collab.remote_protected_approved(mock.Mock(), 1, head, cfg),
+                        f"{stdout!r}/{code} 应拒绝",
+                    )
+
+    def test_remote_approved_only_explicit_false(self):
+        head = "a" * 40
+        cfg = self._cfg()
+        with mock.patch.object(collab, "pr_comments", side_effect=self._approving_comments):
+            p = mock.Mock(returncode=0, stdout='{"isCrossRepository": false}')
+            with mock.patch.object(collab, "gh", return_value=p):
+                self.assertTrue(collab.remote_protected_approved(mock.Mock(), 1, head, cfg))
+
+
+class TestRectificationR2(unittest.TestCase):
+    """R2：二审标记检测 + elite 资格判定（纯函数）。"""
+
+    def test_requires_second_review(self):
+        sha = "a" * 40
+        marker = {"body": f"<!-- collab:second-review pr=1 sha={sha} lease_release_for={sha} exclude_member=alice exclude_family=alice -->"}
+        self.assertTrue(collab.requires_second_review([marker], sha))
+        self.assertFalse(collab.requires_second_review([marker], "b" * 40))
+        self.assertFalse(collab.requires_second_review([], sha))
+        self.assertFalse(collab.requires_second_review([{"body": "普通评论"}], sha))
+
+    def test_is_elite_member(self):
+        cfg = v26_cfg()
+        self.assertTrue(collab.is_elite_member("gemini", cfg))
+        self.assertTrue(collab.is_elite_member("gpt", cfg))
+        self.assertTrue(collab.is_elite_member("antigravity", cfg))
+        self.assertFalse(collab.is_elite_member("qianwen", cfg))
+        self.assertFalse(collab.is_elite_member("baizhi", cfg))
+
+
+class TestSecondReviewDispatch(RepoFixture):
+    """R2：next 派单与 review 执行统一消费二审排除集 + elite 资格。"""
+
+    def setUp(self):
+        super().setUp()
+        cfg = json.loads((self.repo / ".collab" / "config.json").read_text(encoding="utf-8"))
+        cfg["members"] = V26_MEMBERS
+        cfg["routing"] = V26_ROUTING
+        cfg["families"] = {}
+        (self.repo / ".collab" / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "v26 config")
+
+    def _second_review_pr(self):
+        head = self.head()
+        marker = {"body": f"<!-- collab:second-review pr=1 sha={head} lease_release_for={head} exclude_member=workbuddy exclude_family=workbuddy -->"}
+        return self.submitted_pr_state(
+            head, authors="alice", families="alice", issue_labels=["status:review"], comments=[marker],
+        )
+
+    def test_next_skips_excluded_member(self):
+        self._second_review_pr()
+        p = run_tool(self.repo, "next", "--member", "workbuddy", "--json", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertEqual(json.loads(p.stdout)["action"], "idle")
+
+    def test_next_skips_nonelite_member(self):
+        self._second_review_pr()
+        p = run_tool(self.repo, "next", "--member", "qianwen", "--json", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertEqual(json.loads(p.stdout)["action"], "idle")
+
+    def test_next_assigns_elite_member(self):
+        self._second_review_pr()
+        p = run_tool(self.repo, "next", "--member", "gemini", "--json", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertEqual(json.loads(p.stdout)["action"], "review_pr")
+
+    def test_review_rejects_nonelite_member(self):
+        pr = self._second_review_pr()
+        p = run_tool(self.repo, "review", "1", "--member", "qianwen", "--sha", pr["headRefOid"], env=self.env)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn("elite", p.stderr)
+
+
+class TestResetScoping(RepoFixture):
+    """R3：重置按目标工单隔离 + 时区规范化 + 非法时间不触发 + 只消费一次。"""
+
+    def _write_attempts(self, member, data):
+        path = collab.attempts_dir(self.repo) / f"{member}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+        return path
+
+    def _issue_with_reset(self, ts, member="alice"):
+        issue = self.issue(number=1, labels=["status:rework"])
+        issue["comments"] = [{"body": f"<!-- collab:reset-attempts member={member} ts={ts} via=feishu -->"}]
+        return issue
+
+    def test_reset_preserves_other_issue(self):
+        path = self._write_attempts("alice", {
+            "issue#1@rework": {"count": 2, "last_attempt_at": "2026-11-26T00:00:00Z"},
+            "issue#2@rework": {"count": 2, "last_attempt_at": "2026-11-26T00:00:00Z"},
+        })
+        issue = self._issue_with_reset("2026-11-27T00:00:00+00:00")
+        self.write_state({"issues": {"1": issue}, "pr": None, "prs": []})
+        with unittest.mock.patch.dict(os.environ, self.env):
+            collab.reset_attempts_if_requested(self.repo, "alice", 1)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["issue#1@rework"]["count"], 0)
+        self.assertEqual(data["issue#2@rework"]["count"], 2)
+
+    def test_reset_isolated_from_other_issue_newer(self):
+        # Issue 2 有更晚的尝试，不应阻止 Issue 1 的定向重置
+        path = self._write_attempts("alice", {
+            "issue#1@rework": {"count": 2, "last_attempt_at": "2026-11-26T00:00:00Z"},
+            "issue#2@rework": {"count": 2, "last_attempt_at": "2026-11-26T02:00:00Z"},
+        })
+        issue = self._issue_with_reset("2026-11-26T01:00:00Z")
+        self.write_state({"issues": {"1": issue}, "pr": None, "prs": []})
+        with unittest.mock.patch.dict(os.environ, self.env):
+            collab.reset_attempts_if_requested(self.repo, "alice", 1)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["issue#1@rework"]["count"], 0)
+        self.assertEqual(data["issue#2@rework"]["count"], 2)
+
+    def test_reset_invalid_ts_noop(self):
+        path = self._write_attempts("alice", {"issue#1@rework": {"count": 2, "last_attempt_at": "2026-11-26T00:00:00Z"}})
+        issue = self._issue_with_reset("not-a-time")
+        self.write_state({"issues": {"1": issue}, "pr": None, "prs": []})
+        with unittest.mock.patch.dict(os.environ, self.env):
+            collab.reset_attempts_if_requested(self.repo, "alice", 1)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["issue#1@rework"]["count"], 2)
+
+    def test_reset_equal_time_different_format_noop(self):
+        # 等价时间（Z 与 +00:00）不触发清零
+        path = self._write_attempts("alice", {"issue#1@rework": {"count": 2, "last_attempt_at": "2026-11-26T00:00:00+00:00"}})
+        issue = self._issue_with_reset("2026-11-26T00:00:00Z")
+        self.write_state({"issues": {"1": issue}, "pr": None, "prs": []})
+        with unittest.mock.patch.dict(os.environ, self.env):
+            collab.reset_attempts_if_requested(self.repo, "alice", 1)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["issue#1@rework"]["count"], 2)
+
+    def test_reset_consumed_once(self):
+        # 首次重置后产生新尝试，同一旧标记不得再次清零
+        path = self._write_attempts("alice", {"issue#1@rework": {"count": 2, "last_attempt_at": "2026-11-25T00:00:00Z"}})
+        issue = self._issue_with_reset("2026-11-26T00:00:00Z")
+        self.write_state({"issues": {"1": issue}, "pr": None, "prs": []})
+        with unittest.mock.patch.dict(os.environ, self.env):
+            collab.reset_attempts_if_requested(self.repo, "alice", 1)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["issue#1@rework"]["count"], 0)
+        # 重置后成员重新尝试：record_attempt 记录新 last_attempt_at（晚于标记 ts）
+        collab.record_attempt(self.repo, "alice", "issue#1@rework")
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["issue#1@rework"]["count"], 1)
+        # 再次消费同一旧标记：不应再次清零
+        with unittest.mock.patch.dict(os.environ, self.env):
+            collab.reset_attempts_if_requested(self.repo, "alice", 1)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(data["issue#1@rework"]["count"], 1)
 
 
 if __name__ == "__main__":

@@ -925,16 +925,25 @@ def pr_comments(root: Path, pr_number: int):
 
 
 def remote_protected_approved(root: Path, pr_number, head: str, cfg: dict) -> bool:
-    """G1-03/C4：读 PR 评论校验 collab:allow-protected 三要素——评论作者白名单 + sha==HEAD + 非外部 Fork。"""
+    """G1-03/C4：读 PR 评论校验 collab:allow-protected 三要素——评论作者白名单 + sha==HEAD + 非外部 Fork。
+
+    来源核验 fail-closed：远端查询失败、JSON 损坏、字段缺失或类型异常，一律拒绝特批，
+    不得回退到评论读取；只有明确确认 isCrossRepository 为布尔 False 才进入批准判断。
+    """
     if not pr_number:
         return False
     p = gh(root, ["pr", "view", str(pr_number), "--json", "isCrossRepository"], check=False)
-    if p.returncode == 0:
-        try:
-            if json.loads(p.stdout).get("isCrossRepository"):
-                return False
-        except (json.JSONDecodeError, TypeError):
-            pass
+    if p.returncode != 0:
+        return False
+    try:
+        data = json.loads(p.stdout)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    is_cross = data.get("isCrossRepository")
+    if not isinstance(is_cross, bool) or is_cross:
+        return False
     for item in pr_comments(root, pr_number):
         marker = parse_marker_dict(item.get("body") or "", "allow-protected")
         if not marker or (marker.get("sha") or "").lower() != (head or "").lower():
@@ -982,6 +991,23 @@ def second_review_excludes(comments, sha=None):
         if f and f.lower() not in ef:
             ef.append(f.lower())
     return em, ef
+
+
+def requires_second_review(comments, sha=None):
+    """当前 head SHA 上是否存在 collab:second-review 标记（要求王牌二审）。"""
+    for item in comments:
+        marker = parse_marker_dict(item.get("body") or "", "second-review")
+        if not marker:
+            continue
+        if sha and (marker.get("sha") or "").lower() != (sha or "").lower():
+            continue
+        return True
+    return False
+
+
+def is_elite_member(member: str, cfg: dict) -> bool:
+    """成员算力池是否含 elite（王牌二审资格）。"""
+    return "elite" in (resolve_pools(member, cfg) or [])
 
 
 def count_rework_verdicts(comments):
@@ -1990,15 +2016,18 @@ def cmd_review(args):
             f"无法做异族交叉审查；请换一个异族成员验收"
         )
 
-    # G1-02 二审排除集：前审查员与其家族不得复审
-    em, ef = second_review_excludes(pr_comments(root, args.pr), head)
+    # G1-02 二审排除集：前审查员与其家族不得复审；且二审仅 @elite 可接审
+    comments = pr_comments(root, args.pr)
+    em, ef = second_review_excludes(comments, head)
     if member.lower() in em:
         raise Fail(f"该 PR 已要求王牌二审，排除前审查员 `{member}`；请换另一异族成员接审")
     if member_family.lower() in ef:
         raise Fail(f"该 PR 已要求王牌二审，排除前审查家族 `{member_family}`；请换另一异族成员接审")
+    if requires_second_review(comments, head) and not is_elite_member(member, cfg):
+        raise Fail(f"该 PR 已要求王牌二审，仅 @elite 成员可接审；`{member}` 不具备 elite 资格")
 
     # 审查租约：他人未过期的同 SHA 租约存在时拒绝重复审查
-    lease = active_lease(pr_comments(root, args.pr), head, member, cfg["review_lease_minutes"])
+    lease = active_lease(comments, head, member, cfg["review_lease_minutes"])
     if lease:
         raise Fail(
             f"PR #{args.pr} @ {head[:12]} 已被 `{lease.get('member')}` 在有效租约内审查，"
@@ -2101,10 +2130,13 @@ def cmd_review_submit(args):
             f"请换异族成员验收"
         )
 
-    # G1-02 二审排除集
-    em, ef = second_review_excludes(pr_comments(root, args.pr), head)
+    # G1-02 二审排除集（前审查员与其家族不得复审；仅 @elite 可接审）
+    comments = pr_comments(root, args.pr)
+    em, ef = second_review_excludes(comments, head)
     if member.lower() in em or member_family.lower() in ef:
         raise Fail(f"该 PR 已要求王牌二审，排除 `{member}`；请换另一异族成员接审")
+    if requires_second_review(comments, head) and not is_elite_member(member, cfg):
+        raise Fail(f"该 PR 已要求王牌二审，仅 @elite 成员可接审；`{member}` 不具备 elite 资格")
 
     report_file = Path(args.file)
     if not report_file.is_absolute():
@@ -2306,8 +2338,44 @@ def record_attempt(root: Path, member: str, target_key: str) -> int:
     return entry["count"]
 
 
+def parse_ts(value):
+    """把 ISO 时间串解析为带时区的 datetime；非法、缺失或非字符串返回 None。"""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _issue_scope_keys(root: Path, issue_no: int, local: dict):
+    """返回 local 中属于该工单的尝试键：issue#{n}@* 及关联 PR 的 pr#N@*。"""
+    keys = []
+    issue_prefix = f"issue#{issue_no}@"
+    pr_numbers = set()
+    try:
+        prs = list_prs(root)
+    except Fail:
+        prs = []
+    for pr in prs:
+        if parse_marker(pr.get("body") or "", "issue") == str(issue_no):
+            pr_numbers.add(str(pr.get("number")))
+    for key in local:
+        if key.startswith(issue_prefix):
+            keys.append(key)
+            continue
+        m = re.match(r"^pr#(\d+)@", key)
+        if m and m.group(1) in pr_numbers:
+            keys.append(key)
+    return keys
+
+
 def reset_attempts_if_requested(root: Path, member: str, issue_no: int) -> None:
-    """G1-05：若 Issue 评论存在 ts 晚于本地 last_attempt_at 的 collab:reset-attempts，则归零本地计数。"""
+    """G1-05：若 Issue 评论存在 ts 晚于目标工单本地 last_attempt_at 的 collab:reset-attempts，
+    则仅归零该工单（及其关联 PR）的本地计数，不影响其他工单；时间统一带时区比较，非法/缺失不触发。"""
     path = attempts_dir(root) / f"{member}.json"
     if not path.exists():
         return
@@ -2317,17 +2385,27 @@ def reset_attempts_if_requested(root: Path, member: str, issue_no: int) -> None:
         return
     if not isinstance(local, dict) or not local:
         return
-    last_at = ""
-    for entry in local.values():
-        if isinstance(entry, dict) and (entry.get("last_attempt_at") or "") > last_at:
-            last_at = entry["last_attempt_at"]
+    scope_keys = _issue_scope_keys(root, issue_no, local)
+    last_at = None
+    for key in scope_keys:
+        entry = local.get(key)
+        dt = parse_ts(entry.get("last_attempt_at")) if isinstance(entry, dict) else None
+        if dt is not None and (last_at is None or dt > last_at):
+            last_at = dt
     for item in issue_comments(root, issue_no):
         marker = parse_marker_dict(item.get("body") or "", "reset-attempts")
         if not marker or (marker.get("member") or "").lower() != member.lower():
             continue
-        ts = marker.get("ts") or ""
-        if ts and ts > last_at:
-            write_atomic(path, json.dumps({}, ensure_ascii=False))
+        ts = parse_ts(marker.get("ts"))
+        if ts is None:
+            continue
+        if last_at is None or ts > last_at:
+            for key in scope_keys:
+                entry = local.get(key)
+                if isinstance(entry, dict):
+                    entry["count"] = 0
+                    entry["last_attempt_at"] = ts.isoformat()
+            write_atomic(path, json.dumps(local, ensure_ascii=False, indent=2))
             return
 
 
@@ -2540,7 +2618,14 @@ def cmd_next(args):
                         if cfg["require_cross_family_review"] and member_family in author_families:
                             continue
                         head_sha = pr.get("headRefOid", "")
-                        if active_lease(pr_comments(root, pr["number"]), head_sha, member, cfg["review_lease_minutes"]):
+                        comments = pr_comments(root, pr["number"])
+                        # G1-02：二审排除集 + @elite 资格在派单侧就消费，避免把成员引向不可执行任务
+                        em, ef = second_review_excludes(comments, head_sha)
+                        if member.lower() in em or member_family.lower() in ef:
+                            continue
+                        if requires_second_review(comments, head_sha) and not is_elite_member(member, cfg):
+                            continue
+                        if active_lease(comments, head_sha, member, cfg["review_lease_minutes"]):
                             continue
                         review_item = {
                             "labels": [{"name": n} for n in names],
@@ -2619,7 +2704,14 @@ def cmd_next(args):
             if cfg["require_cross_family_review"] and member_family in author_families:
                 continue
             head_sha = pr.get("headRefOid", "")
-            if active_lease(pr_comments(root, pr["number"]), head_sha, member, cfg["review_lease_minutes"]):
+            comments = pr_comments(root, pr["number"])
+            # G1-02：二审排除集 + @elite 资格在派单侧就消费
+            em, ef = second_review_excludes(comments, head_sha)
+            if member.lower() in em or member_family.lower() in ef:
+                continue
+            if requires_second_review(comments, head_sha) and not is_elite_member(member, cfg):
+                continue
+            if active_lease(comments, head_sha, member, cfg["review_lease_minutes"]):
                 continue
             review_item = {
                 "labels": [{"name": n} for n in names],
