@@ -18,6 +18,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "scripts" / "collab.py"
@@ -348,6 +349,25 @@ class TestPureFunctions(unittest.TestCase):
         ]
         self.assertEqual(collab.current_owner(comments), "gemini")
 
+    def test_active_lease_released_by_second_review(self):
+        # G1-02：租约之后出现 lease_release_for==sha 的二审标记 → 旧租约显式作废
+        sha = "a" * 40
+        exp = (collab.datetime.now(collab.timezone.utc) + collab.timedelta(minutes=30)).isoformat().replace("+00:00", "Z")
+        lease = {"body": f"<!-- collab:review-lease pr=1 sha={sha} member=alice family=x expires_at={exp} -->"}
+        second = {"body": f"<!-- collab:second-review pr=1 sha={sha} lease_release_for={sha} exclude_member=alice exclude_family=x -->"}
+        self.assertIsNone(collab.active_lease([lease, second], sha, "bob", 30))
+        self.assertIsNotNone(collab.active_lease([lease], sha, "bob", 30))
+
+    def test_second_review_excludes(self):
+        # G1-02：解析二审排除集（前审查员 + 前审查家族）
+        sha = "a" * 40
+        comments = [
+            {"body": f"<!-- collab:second-review pr=1 sha={sha} lease_release_for={sha} exclude_member=alice exclude_family=alice_fam -->"},
+        ]
+        em, ef = collab.second_review_excludes(comments, sha)
+        self.assertEqual(em, ["alice"])
+        self.assertEqual(ef, ["alice_fam"])
+
 
 class TestGate(RepoFixture):
     def test_gate_passes_and_writes_receipt(self):
@@ -495,6 +515,33 @@ class TestMisc(RepoFixture):
         self.assertTrue(lock.exists())
         collab.clear_member_lock(self.repo, "alice")
         self.assertFalse(lock.exists())
+
+    def test_remote_protected_approved(self):
+        # G1-03：只有评论作者白名单 + sha==HEAD + 非 Fork 时才放行
+        head = self.head()
+        cfg = collab.load_config(self.repo)
+        pr = {
+            "number": 1, "isCrossRepository": False,
+            "comments": [{"body": f"<!-- collab:allow-protected pr=1 sha={head} operator=fake-gh-user via=feishu -->",
+                          "author": {"login": "fake-gh-user"}}],
+        }
+        self.write_state({"issues": {}, "pr": pr, "prs": [pr]})
+        with unittest.mock.patch.dict(os.environ, self.env):
+            self.assertTrue(collab.remote_protected_approved(self.repo, 1, head, cfg))
+            # sha 不匹配 → 拒绝
+            self.assertFalse(collab.remote_protected_approved(self.repo, 1, "b" * 40, cfg))
+
+    def test_reset_attempts_if_requested(self):
+        # G1-05：Issue 有 ts 晚于本地 last_attempt_at 的 reset 标记 → 归零本地计数
+        path = collab.attempts_dir(self.repo) / "alice.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"issue#1@rework": {"count": 2, "last_attempt_at": "2026-11-26T00:00:00+00:00"}}))
+        issue = self.issue(number=1, labels=["status:rework"])
+        issue["comments"] = [{"body": "<!-- collab:reset-attempts member=alice ts=2026-11-27T00:00:00+00:00 via=feishu -->"}]
+        self.write_state({"issues": {"1": issue}, "pr": None, "prs": []})
+        with unittest.mock.patch.dict(os.environ, self.env):
+            collab.reset_attempts_if_requested(self.repo, "alice", 1)
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8")), {})
 
 
 class TestFlow(RepoFixture):
@@ -857,6 +904,16 @@ class TestV23(RepoFixture):
         remove_labels = [tok for c in edits for i, tok in enumerate(c["args"]) if c["args"][i - 1] == "--remove-label"]
         self.assertIn("status:review", remove_labels)
         self.assertIn("review:agent-passed", remove_labels)
+
+    def test_accept_sha_mismatch_rejects(self):
+        # G1-04：--sha 与当前 head 失配 → 硬拒绝
+        head = self._prepare_branch()
+        self.submitted_pr_state(head, authors="alice", families="alice",
+                                issue_labels=["status:review", "review:agent-passed"])
+        git(self.repo, "checkout", "-q", "main")
+        p = run_tool(self.repo, "accept", "1", "--member", "human", "--sha", "b" * 40, env=self.env)
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("SHA 失配", p.stderr)
 
     def test_release_returns_to_ready(self):
         issue = self.owned_issue(2, "status:in-progress", "alice")

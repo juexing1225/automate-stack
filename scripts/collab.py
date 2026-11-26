@@ -924,6 +924,28 @@ def pr_comments(root: Path, pr_number: int):
         return []
 
 
+def remote_protected_approved(root: Path, pr_number, head: str, cfg: dict) -> bool:
+    """G1-03/C4：读 PR 评论校验 collab:allow-protected 三要素——评论作者白名单 + sha==HEAD + 非外部 Fork。"""
+    if not pr_number:
+        return False
+    p = gh(root, ["pr", "view", str(pr_number), "--json", "isCrossRepository"], check=False)
+    if p.returncode == 0:
+        try:
+            if json.loads(p.stdout).get("isCrossRepository"):
+                return False
+        except (json.JSONDecodeError, TypeError):
+            pass
+    for item in pr_comments(root, pr_number):
+        marker = parse_marker_dict(item.get("body") or "", "allow-protected")
+        if not marker or (marker.get("sha") or "").lower() != (head or "").lower():
+            continue
+        author = item.get("author") or {}
+        login = author.get("login", "") if isinstance(author, dict) else ""
+        if login in cfg.get("trusted_github_logins", []):
+            return True
+    return False
+
+
 def latest_review_verdict(comments):
     """按出现顺序返回最后一条 collab:review 标记；无则 None。"""
     found = None
@@ -944,6 +966,24 @@ def latest_rework_body(comments):
     return found
 
 
+def second_review_excludes(comments, sha=None):
+    """G1-02：返回所有 collab:second-review 的 (exclude_members, exclude_families)。"""
+    em, ef = [], []
+    for item in comments:
+        marker = parse_marker_dict(item.get("body") or "", "second-review")
+        if not marker:
+            continue
+        if sha and (marker.get("sha") or "").lower() != (sha or "").lower():
+            continue
+        m = marker.get("exclude_member")
+        if m and m.lower() not in em:
+            em.append(m.lower())
+        f = marker.get("exclude_family")
+        if f and f.lower() not in ef:
+            ef.append(f.lower())
+    return em, ef
+
+
 def count_rework_verdicts(comments):
     """统计最近一次 collab:reset-rework 之后的 verdict=REWORK 次数。"""
     count = 0
@@ -959,9 +999,13 @@ def count_rework_verdicts(comments):
 
 
 def active_lease(comments, sha: str, member: str, lease_minutes: int):
-    """返回当前 head SHA 上「他人未过期」的 review-lease；无则 None。"""
+    """返回当前 head SHA 上「他人未过期」的 review-lease；无则 None。
+
+    若租约评论之后出现 `collab:second-review ... lease_release_for=<sha>`，视为显式作废旧租约
+    （避免「要求王牌二审」被前审查员 30 分钟租约挡死）。
+    """
     now = datetime.now(timezone.utc)
-    for item in comments:
+    for i, item in enumerate(comments):
         marker = parse_marker_dict(item.get("body") or "", "review-lease")
         if not marker or marker.get("sha", "").lower() != (sha or "").lower():
             continue
@@ -970,10 +1014,19 @@ def active_lease(comments, sha: str, member: str, lease_minutes: int):
         expires = marker.get("expires_at") or ""
         try:
             expiry = datetime.fromisoformat(expires.replace("Z", "+00:00"))
-            if expiry > now:
-                return marker
         except ValueError:
             continue
+        if expiry <= now:
+            continue
+        # 该租约之后是否存在针对同一 SHA 的二审作废标记
+        released = False
+        for later in comments[i + 1:]:
+            sr = parse_marker_dict(later.get("body") or "", "second-review")
+            if sr and (sr.get("lease_release_for") or "").lower() == (sha or "").lower():
+                released = True
+                break
+        if not released:
+            return marker
     return None
 
 
@@ -1462,6 +1515,8 @@ def run_gate(
     base=None,
     allow_dirty=False,
     allow_protected=False,
+    check_remote_approval=False,
+    pr_number=None,
     quiet=False,
 ):
     repo = repo.resolve()
@@ -1484,7 +1539,11 @@ def run_gate(
     protected = [(f, match_any(f, protected_globs)) for f in files]
     protected = [(f, g) for f, g in protected if g]
     if protected and not allow_protected:
-        problems.append("改动受保护文件（需要人放行时加 --allow-protected）：\n  - " + "\n  - ".join(f for f, _ in protected))
+        # G1-03/C4：桥接器可传 --check-remote-approval + --pr，联网核验 PR 评论里的 SHA 特批
+        if check_remote_approval and remote_protected_approved(repo, pr_number, head, cfg):
+            allow_protected = True
+        else:
+            problems.append("改动受保护文件（需要人放行时加 --allow-protected）：\n  - " + "\n  - ".join(f for f, _ in protected))
 
     secrets = scan_secrets(repo, files, cfg)
     tracked = tracked_secret_files(repo, cfg)
@@ -1583,6 +1642,8 @@ def cmd_gate(args):
         role="author",
         allow_dirty=args.dirty,
         allow_protected=args.allow_protected,
+        check_remote_approval=args.check_remote_approval,
+        pr_number=args.pr,
     )
     if args.out:
         out_path = Path(args.out)
@@ -1929,6 +1990,13 @@ def cmd_review(args):
             f"无法做异族交叉审查；请换一个异族成员验收"
         )
 
+    # G1-02 二审排除集：前审查员与其家族不得复审
+    em, ef = second_review_excludes(pr_comments(root, args.pr), head)
+    if member.lower() in em:
+        raise Fail(f"该 PR 已要求王牌二审，排除前审查员 `{member}`；请换另一异族成员接审")
+    if member_family.lower() in ef:
+        raise Fail(f"该 PR 已要求王牌二审，排除前审查家族 `{member_family}`；请换另一异族成员接审")
+
     # 审查租约：他人未过期的同 SHA 租约存在时拒绝重复审查
     lease = active_lease(pr_comments(root, args.pr), head, member, cfg["review_lease_minutes"])
     if lease:
@@ -2032,6 +2100,11 @@ def cmd_review_submit(args):
             f"同族审查被拒：{member}（family={member_family}）与作者家族 {author_families} 同源；"
             f"请换异族成员验收"
         )
+
+    # G1-02 二审排除集
+    em, ef = second_review_excludes(pr_comments(root, args.pr), head)
+    if member.lower() in em or member_family.lower() in ef:
+        raise Fail(f"该 PR 已要求王牌二审，排除 `{member}`；请换另一异族成员接审")
 
     report_file = Path(args.file)
     if not report_file.is_absolute():
@@ -2163,6 +2236,9 @@ def cmd_accept(args):
     if pr.get("state") != "OPEN":
         raise Fail(f"PR #{args.pr} 不是打开状态（{pr.get('state')}）")
     head = pr.get("headRefOid", "")
+    # G1-04：--sha 强绑定，传入时校验与当前 head 一致，防漂移后误终审
+    if getattr(args, "sha", "") and args.sha.strip().lower() != head.lower():
+        raise Fail(f"验收 SHA 失配：--sha {args.sha[:12]} ≠ PR 当前 head {head[:12]}；PR 已更新，请重新核验")
 
     issue_no = parse_marker(pr.get("body") or "", "issue")
     if not issue_no or not issue_no.isdigit():
@@ -2228,6 +2304,31 @@ def record_attempt(root: Path, member: str, target_key: str) -> int:
     entry["last_attempt_at"] = now_iso()
     write_atomic(attempts_dir(root) / f"{member}.json", json.dumps(attempts, ensure_ascii=False, indent=2))
     return entry["count"]
+
+
+def reset_attempts_if_requested(root: Path, member: str, issue_no: int) -> None:
+    """G1-05：若 Issue 评论存在 ts 晚于本地 last_attempt_at 的 collab:reset-attempts，则归零本地计数。"""
+    path = attempts_dir(root) / f"{member}.json"
+    if not path.exists():
+        return
+    try:
+        local = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, TypeError):
+        return
+    if not isinstance(local, dict) or not local:
+        return
+    last_at = ""
+    for entry in local.values():
+        if isinstance(entry, dict) and (entry.get("last_attempt_at") or "") > last_at:
+            last_at = entry["last_attempt_at"]
+    for item in issue_comments(root, issue_no):
+        marker = parse_marker_dict(item.get("body") or "", "reset-attempts")
+        if not marker or (marker.get("member") or "").lower() != member.lower():
+            continue
+        ts = marker.get("ts") or ""
+        if ts and ts > last_at:
+            write_atomic(path, json.dumps({}, ensure_ascii=False))
+            return
 
 
 def fuse_issue(root: Path, issue_no: int, member: str, target_key: str, max_attempts: int):
@@ -2349,6 +2450,7 @@ def cmd_next(args):
 
     def pick(target_key, issue_no, build):
         nonlocal result
+        reset_attempts_if_requested(root, member, issue_no)
         if read_attempts(root, member).get(target_key, {}).get("count", 0) >= cfg["max_attempts_per_target"]:
             fuse_issue(root, issue_no, member, target_key, cfg["max_attempts_per_target"])
             return False
@@ -2694,6 +2796,8 @@ def build_parser():
     p.add_argument("--profile", choices=PROFILES, default="fast")
     p.add_argument("--dirty", action="store_true", help="允许脏工作区（仅自测，回执不能交单）")
     p.add_argument("--allow-protected", action="store_true", help="人放行受保护文件")
+    p.add_argument("--check-remote-approval", action="store_true", help="联网核验 PR 评论里的 SHA 特批（C4）")
+    p.add_argument("--pr", type=int, default=None, help="配合 --check-remote-approval 指定 PR 号")
     p.add_argument("--out", help="回执副本路径")
     p.set_defaults(func=cmd_gate)
 
@@ -2728,6 +2832,7 @@ def build_parser():
     p.add_argument("pr", type=int)
     p.add_argument("--member", required=True, help="终审人 member ID（人类）")
     p.add_argument("--family", default=argparse.SUPPRESS, help="多模型宿主临时家族覆写（如 antigravity --family claude）")
+    p.add_argument("--sha", default="", help="强绑定验收目标 head SHA；与当前 PR head 不一致即拒绝")
     p.add_argument("--allow-same-family", action="store_true", help="单模型紧急降级：允许同族 PASS 终审（留痕）")
     p.set_defaults(func=cmd_accept)
 
