@@ -4,7 +4,8 @@
   "worktree_root": ".collab/worktrees",
   "require_cross_family_review": true,
   "trusted_github_logins": [
-    "juexing1225"
+    "juexing1225",
+    "juexing-bot"
   ],
   "max_wip_per_member": 1,
   "max_rework_rounds": 3,
