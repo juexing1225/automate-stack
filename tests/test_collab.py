@@ -534,14 +534,16 @@ class TestMisc(RepoFixture):
 
     def test_reset_attempts_if_requested(self):
         # G1-05：Issue 有 ts 晚于本地 last_attempt_at 的 reset 标记 → 仅归零目标工单计数
+        cfg = collab.load_config(self.repo)
         path = collab.attempts_dir(self.repo) / "alice.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"issue#1@rework": {"count": 2, "last_attempt_at": "2026-11-26T00:00:00+00:00"}}))
         issue = self.issue(number=1, labels=["status:rework"])
-        issue["comments"] = [{"body": "<!-- collab:reset-attempts member=alice ts=2026-11-27T00:00:00+00:00 via=feishu -->"}]
+        issue["comments"] = [{"body": "<!-- collab:reset-attempts member=alice ts=2026-11-27T00:00:00+00:00 via=feishu -->",
+                              "author": {"login": "fake-gh-user"}}]
         self.write_state({"issues": {"1": issue}, "pr": None, "prs": []})
         with unittest.mock.patch.dict(os.environ, self.env):
-            collab.reset_attempts_if_requested(self.repo, "alice", 1)
+            collab.reset_attempts_if_requested(self.repo, "alice", 1, cfg)
         data = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(data["issue#1@rework"]["count"], 0)
 
@@ -936,6 +938,32 @@ class TestV23(RepoFixture):
         data = json.loads(p.stdout)
         self.assertEqual(data["action"], "fix_rework")
         self.assertEqual(data["issue"], 2)
+
+    def test_next_lands_feishu_rework_file(self):
+        # F3：飞书人工 REWORK 评论（via=feishu、verdict=REWORK）被 next 正确落盘 rework-latest.md
+        head = self.head()
+        rework = self.owned_issue(2, "status:rework", "alice")
+        pr = {
+            "number": 1,
+            "url": "https://example.test/pull/1",
+            "headRefOid": head,
+            "headRefName": "work/issue-2",
+            "baseRefName": "main",
+            "state": "OPEN",
+            "body": "<!-- collab:issue=2 -->",
+            "author": {"login": "fake-gh-user"},
+            "isCrossRepository": False,
+            "comments": [{"body": f"<!-- collab:review pr=1 issue=2 sha={head} member=baizhi family=baizhi verdict=REWORK via=feishu proxy=false -->"}],
+        }
+        self.write_state({"issues": {"2": rework}, "pr": pr, "prs": [pr]})
+        p = run_tool(self.repo, "next", "--member", "alice", "--json", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        data = json.loads(p.stdout)
+        self.assertEqual(data["action"], "fix_rework")
+        self.assertEqual(data["issue"], 2)
+        rework_file = self.repo / ".collab" / "worktrees" / "issue-2" / ".collab" / "rework-latest.md"
+        self.assertTrue(rework_file.exists())
+        self.assertIn("verdict=REWORK", rework_file.read_text(encoding="utf-8"))
 
     def test_next_wip_blocks_claim(self):
         doing = self.owned_issue(2, "status:in-progress", "alice")
@@ -1360,6 +1388,74 @@ class TestSecondReviewDispatch(RepoFixture):
         self.assertIn("elite", p.stderr)
 
 
+class TestF1SecondReviewLadder(RepoFixture):
+    """F1：basic 工单关联待审 PR + collab:second-review 时，合格异族 elite 不被 basic 审查阶梯阻挡。"""
+
+    def setUp(self):
+        super().setUp()
+        cfg = json.loads((self.repo / ".collab" / "config.json").read_text(encoding="utf-8"))
+        cfg["members"] = V26_MEMBERS
+        cfg["routing"] = V26_ROUTING
+        cfg["families"] = {}
+        (self.repo / ".collab" / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "v26 config")
+
+    def _basic_second_review_pr(self, exclude_member="workbuddy", exclude_family="workbuddy", with_marker=True):
+        head = self.head()
+        comments = []
+        if with_marker:
+            comments.append({"body": f"<!-- collab:second-review pr=1 sha={head} lease_release_for={head} exclude_member={exclude_member} exclude_family={exclude_family} -->"})
+        pr = {
+            "number": 1,
+            "url": "https://example.test/pull/1",
+            "headRefOid": head,
+            "headRefName": "work/issue-1",
+            "baseRefName": "main",
+            "state": "OPEN",
+            "body": "<!-- collab:authors=alice -->\n<!-- collab:families=alice -->\n<!-- collab:issue=1 -->",
+            "author": {"login": "fake-gh-user"},
+            "isCrossRepository": False,
+            "updatedAt": collab.now_iso(),
+            "comments": comments,
+        }
+        self.write_state({"issues": {"1": self.issue(labels=["status:review", "tier:basic"])}, "pr": pr, "prs": [pr]})
+        return pr
+
+    def test_next_role_review_elite_immediate(self):
+        self._basic_second_review_pr()
+        p = run_tool(self.repo, "next", "--member", "gpt", "--role", "review", "--json", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertEqual(json.loads(p.stdout)["action"], "review_pr")
+
+    def test_next_role_any_elite_immediate(self):
+        self._basic_second_review_pr()
+        p = run_tool(self.repo, "next", "--member", "gpt", "--role", "any", "--json", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertEqual(json.loads(p.stdout)["action"], "review_pr")
+
+    def test_next_second_review_excluded_family_still_rejected(self):
+        # gpt 属 openai 家族，即使 elite 合格，被 exclude_family 排除仍不得派单
+        self._basic_second_review_pr(exclude_member="other", exclude_family="openai")
+        p = run_tool(self.repo, "next", "--member", "gpt", "--role", "review", "--json", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertEqual(json.loads(p.stdout)["action"], "idle")
+
+    def test_next_second_review_nonelite_still_rejected(self):
+        # qianwen 非 elite，即使无排除标记也不得接二审
+        self._basic_second_review_pr()
+        p = run_tool(self.repo, "next", "--member", "qianwen", "--role", "review", "--json", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertEqual(json.loads(p.stdout)["action"], "idle")
+
+    def test_next_basic_no_second_review_elite_still_blocked(self):
+        # 无二审标记：basic 工单 0~30 分钟内 elite 仍走普通阶梯被挡（force_tier 不得误放行）
+        self._basic_second_review_pr(with_marker=False)
+        p = run_tool(self.repo, "next", "--member", "gpt", "--role", "review", "--json", env=self.env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertEqual(json.loads(p.stdout)["action"], "idle")
+
+
 class TestResetScoping(RepoFixture):
     """R3：重置按目标工单隔离 + 时区规范化 + 非法时间不触发 + 只消费一次。"""
 
@@ -1369,10 +1465,14 @@ class TestResetScoping(RepoFixture):
         path.write_text(json.dumps(data), encoding="utf-8")
         return path
 
-    def _issue_with_reset(self, ts, member="alice"):
+    def _issue_with_reset(self, ts, member="alice", author="fake-gh-user"):
         issue = self.issue(number=1, labels=["status:rework"])
-        issue["comments"] = [{"body": f"<!-- collab:reset-attempts member={member} ts={ts} via=feishu -->"}]
+        issue["comments"] = [{"body": f"<!-- collab:reset-attempts member={member} ts={ts} via=feishu -->",
+                              "author": {"login": author}}]
         return issue
+
+    def _cfg(self):
+        return collab.load_config(self.repo)
 
     def test_reset_preserves_other_issue(self):
         path = self._write_attempts("alice", {
@@ -1382,7 +1482,7 @@ class TestResetScoping(RepoFixture):
         issue = self._issue_with_reset("2026-11-27T00:00:00+00:00")
         self.write_state({"issues": {"1": issue}, "pr": None, "prs": []})
         with unittest.mock.patch.dict(os.environ, self.env):
-            collab.reset_attempts_if_requested(self.repo, "alice", 1)
+            collab.reset_attempts_if_requested(self.repo, "alice", 1, self._cfg())
         data = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(data["issue#1@rework"]["count"], 0)
         self.assertEqual(data["issue#2@rework"]["count"], 2)
@@ -1396,7 +1496,7 @@ class TestResetScoping(RepoFixture):
         issue = self._issue_with_reset("2026-11-26T01:00:00Z")
         self.write_state({"issues": {"1": issue}, "pr": None, "prs": []})
         with unittest.mock.patch.dict(os.environ, self.env):
-            collab.reset_attempts_if_requested(self.repo, "alice", 1)
+            collab.reset_attempts_if_requested(self.repo, "alice", 1, self._cfg())
         data = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(data["issue#1@rework"]["count"], 0)
         self.assertEqual(data["issue#2@rework"]["count"], 2)
@@ -1406,7 +1506,7 @@ class TestResetScoping(RepoFixture):
         issue = self._issue_with_reset("not-a-time")
         self.write_state({"issues": {"1": issue}, "pr": None, "prs": []})
         with unittest.mock.patch.dict(os.environ, self.env):
-            collab.reset_attempts_if_requested(self.repo, "alice", 1)
+            collab.reset_attempts_if_requested(self.repo, "alice", 1, self._cfg())
         data = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(data["issue#1@rework"]["count"], 2)
 
@@ -1416,7 +1516,7 @@ class TestResetScoping(RepoFixture):
         issue = self._issue_with_reset("2026-11-26T00:00:00Z")
         self.write_state({"issues": {"1": issue}, "pr": None, "prs": []})
         with unittest.mock.patch.dict(os.environ, self.env):
-            collab.reset_attempts_if_requested(self.repo, "alice", 1)
+            collab.reset_attempts_if_requested(self.repo, "alice", 1, self._cfg())
         data = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(data["issue#1@rework"]["count"], 2)
 
@@ -1426,7 +1526,7 @@ class TestResetScoping(RepoFixture):
         issue = self._issue_with_reset("2026-11-26T00:00:00Z")
         self.write_state({"issues": {"1": issue}, "pr": None, "prs": []})
         with unittest.mock.patch.dict(os.environ, self.env):
-            collab.reset_attempts_if_requested(self.repo, "alice", 1)
+            collab.reset_attempts_if_requested(self.repo, "alice", 1, self._cfg())
         data = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(data["issue#1@rework"]["count"], 0)
         # 重置后成员重新尝试：record_attempt 记录新 last_attempt_at（晚于标记 ts）
@@ -1435,9 +1535,27 @@ class TestResetScoping(RepoFixture):
         self.assertEqual(data["issue#1@rework"]["count"], 1)
         # 再次消费同一旧标记：不应再次清零
         with unittest.mock.patch.dict(os.environ, self.env):
-            collab.reset_attempts_if_requested(self.repo, "alice", 1)
+            collab.reset_attempts_if_requested(self.repo, "alice", 1, self._cfg())
         data = json.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(data["issue#1@rework"]["count"], 1)
+
+    def test_reset_requires_trusted_author(self):
+        # S1：评论作者须在 trusted_github_logins 白名单内才消费 reset-attempts
+        cfg = self._cfg()
+        # 白名单内作者（fake-gh-user）→ 归零生效
+        path = self._write_attempts("alice", {"issue#1@rework": {"count": 2, "last_attempt_at": "2026-11-26T00:00:00Z"}})
+        trusted = self._issue_with_reset("2026-11-27T00:00:00+00:00", author="fake-gh-user")
+        self.write_state({"issues": {"1": trusted}, "pr": None, "prs": []})
+        with unittest.mock.patch.dict(os.environ, self.env):
+            collab.reset_attempts_if_requested(self.repo, "alice", 1, cfg)
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["issue#1@rework"]["count"], 0)
+        # 白名单外作者（evil-user）→ 不归零，计数保留
+        path.write_text(json.dumps({"issue#1@rework": {"count": 2, "last_attempt_at": "2026-11-26T00:00:00Z"}}))
+        untrusted = self._issue_with_reset("2026-11-27T00:00:00+00:00", author="evil-user")
+        self.write_state({"issues": {"1": untrusted}, "pr": None, "prs": []})
+        with unittest.mock.patch.dict(os.environ, self.env):
+            collab.reset_attempts_if_requested(self.repo, "alice", 1, cfg)
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["issue#1@rework"]["count"], 2)
 
 
 if __name__ == "__main__":

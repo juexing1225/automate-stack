@@ -575,7 +575,7 @@ def _last_activity_minutes(item: dict, now) -> float:
     return 0.0
 
 
-def check_stage_eligibility(item: dict, member: str, cfg: dict, now=None, role="dev") -> bool:
+def check_stage_eligibility(item: dict, member: str, cfg: dict, now=None, role="dev", force_tier=None) -> bool:
     """无状态算力池阶梯判定：成员在当前时间窗是否有资格领取/审查该任务。
 
     item：Issue 或 PR 的 JSON；role：dev（领单）或 review（审单）。
@@ -607,6 +607,9 @@ def check_stage_eligibility(item: dict, member: str, cfg: dict, now=None, role="
     # 高风险变更：审查侧自动升级为 hard 级策略（方案：risk:high 审查走 hard 阶梯）
     if role == "review" and "risk:high" in names:
         tier = "hard"
+    # 二审派单强制 hard 阶梯：force_tier 覆盖 tier 时间窗；risk:high 的 hard 升级语义保留
+    if force_tier:
+        tier = force_tier
     spec = tiers.get(tier) or tiers.get("standard") or {}
     stages_key = "review_stages" if role == "review" else "stages"
     stages = spec.get(stages_key) or []
@@ -2373,9 +2376,10 @@ def _issue_scope_keys(root: Path, issue_no: int, local: dict):
     return keys
 
 
-def reset_attempts_if_requested(root: Path, member: str, issue_no: int) -> None:
+def reset_attempts_if_requested(root: Path, member: str, issue_no: int, cfg: dict) -> None:
     """G1-05：若 Issue 评论存在 ts 晚于目标工单本地 last_attempt_at 的 collab:reset-attempts，
-    则仅归零该工单（及其关联 PR）的本地计数，不影响其他工单；时间统一带时区比较，非法/缺失不触发。"""
+    则仅归零该工单（及其关联 PR）的本地计数，不影响其他工单；时间统一带时区比较，非法/缺失不触发。
+    评论作者须在 trusted_github_logins 白名单内才消费（对齐 remote_protected_approved 信任模型）。"""
     path = attempts_dir(root) / f"{member}.json"
     if not path.exists():
         return
@@ -2395,6 +2399,10 @@ def reset_attempts_if_requested(root: Path, member: str, issue_no: int) -> None:
     for item in issue_comments(root, issue_no):
         marker = parse_marker_dict(item.get("body") or "", "reset-attempts")
         if not marker or (marker.get("member") or "").lower() != member.lower():
+            continue
+        author = item.get("author") or {}
+        login = author.get("login", "") if isinstance(author, dict) else ""
+        if login not in cfg.get("trusted_github_logins", []):
             continue
         ts = parse_ts(marker.get("ts"))
         if ts is None:
@@ -2528,7 +2536,7 @@ def cmd_next(args):
 
     def pick(target_key, issue_no, build):
         nonlocal result
-        reset_attempts_if_requested(root, member, issue_no)
+        reset_attempts_if_requested(root, member, issue_no, cfg)
         if read_attempts(root, member).get(target_key, {}).get("count", 0) >= cfg["max_attempts_per_target"]:
             fuse_issue(root, issue_no, member, target_key, cfg["max_attempts_per_target"])
             return False
@@ -2623,7 +2631,8 @@ def cmd_next(args):
                         em, ef = second_review_excludes(comments, head_sha)
                         if member.lower() in em or member_family.lower() in ef:
                             continue
-                        if requires_second_review(comments, head_sha) and not is_elite_member(member, cfg):
+                        second_review_required = requires_second_review(comments, head_sha)
+                        if second_review_required and not is_elite_member(member, cfg):
                             continue
                         if active_lease(comments, head_sha, member, cfg["review_lease_minutes"]):
                             continue
@@ -2632,7 +2641,10 @@ def cmd_next(args):
                             "body": issue_body,
                             "updatedAt": pr.get("updatedAt") or pr.get("createdAt"),
                         }
-                        if not check_stage_eligibility(review_item, member, cfg, role="review"):
+                        if not check_stage_eligibility(
+                            review_item, member, cfg, role="review",
+                            force_tier="hard" if second_review_required else None,
+                        ):
                             continue
                         pr_no = pr["number"]
                         key = f"pr#{pr_no}@{head_sha[:12]}"
@@ -2709,7 +2721,8 @@ def cmd_next(args):
             em, ef = second_review_excludes(comments, head_sha)
             if member.lower() in em or member_family.lower() in ef:
                 continue
-            if requires_second_review(comments, head_sha) and not is_elite_member(member, cfg):
+            second_review_required = requires_second_review(comments, head_sha)
+            if second_review_required and not is_elite_member(member, cfg):
                 continue
             if active_lease(comments, head_sha, member, cfg["review_lease_minutes"]):
                 continue
@@ -2718,7 +2731,10 @@ def cmd_next(args):
                 "body": issue_body,
                 "updatedAt": pr.get("updatedAt") or pr.get("createdAt"),
             }
-            if not check_stage_eligibility(review_item, member, cfg, role="review"):
+            if not check_stage_eligibility(
+                review_item, member, cfg, role="review",
+                force_tier="hard" if second_review_required else None,
+            ):
                 continue
             pr_no = pr["number"]
             key = f"pr#{pr_no}@{head_sha[:12]}"
