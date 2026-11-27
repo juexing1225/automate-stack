@@ -252,6 +252,7 @@ class Router:
                     warning=result.warning,
                     epoch=self.store.epoch,
                     retry_labels_issue=result.retry_labels_issue,
+                    retry_labels_sha=result.retry_labels_sha,
                 ),
             )
 
@@ -389,6 +390,24 @@ class Router:
             return
 
         if pr.get("state") != "OPEN":
+            # 只读刷新不得误报失败：合并/关闭后的卡片应就地收敛为「已闭环」终态并移除按钮。
+            if name == "refresh":
+                self.audit.write(operator, "card:refresh", str(number), "ok")
+                self._update(
+                    event,
+                    cards.result_card(
+                        "✅ 已闭环",
+                        "PR #%s 当前状态 %s，本卡已归档，无需再操作。"
+                        % (number, pr.get("state")),
+                        True,
+                        pr=number,
+                        terminal=True,
+                        epoch=self.store.epoch,
+                    ),
+                    "PR #%s 已闭环，卡片已归档。" % number,
+                    operator,
+                )
+                return
             self.audit.write(operator, "card:" + name, str(number), "fail")
             self._update(
                 event,
@@ -487,6 +506,23 @@ class Router:
                 "%s %.1fs" % (number, time.time() - started),
                 "ok" if result.ok else "fail",
             )
+            if result.ok:
+                # 内部闭环必须落盘来源并关闭该飞书记录，否则对账会把它误标为「外部闭环（GitHub/CLI）」。
+                self.store.mark_feishu_closed("pr", number, sha, source="internal")
+                self._update(
+                    event,
+                    cards.result_card(
+                        "✅ 已闭环",
+                        "手机终审已完成并通过并合并。%s" % (result.detail or "").strip(),
+                        True,
+                        pr=number,
+                        terminal=True,
+                        epoch=self.store.epoch,
+                    ),
+                    "✅ 已闭环\n\n%s" % result.detail[:2500],
+                    operator,
+                )
+                return
             self._update(
                 event,
                 cards.result_card(
@@ -538,6 +574,23 @@ class Router:
             self.audit.write(
                 operator, "card:retry_merge", str(number), "ok" if result.ok else "fail"
             )
+            if result.ok:
+                # G3-06 重试合并成功同为内部闭环：须落盘来源并收敛无按钮终态卡，避免对账误标外部。
+                self.store.mark_feishu_closed("pr", number, sha, source="internal")
+                self._update(
+                    event,
+                    cards.result_card(
+                        "✅ 已闭环",
+                        "重试合并已完成。%s" % (result.detail or "").strip(),
+                        True,
+                        pr=number,
+                        terminal=True,
+                        epoch=self.store.epoch,
+                    ),
+                    "✅ 已闭环\n\n%s" % result.detail[:2500],
+                    operator,
+                )
+                return
             self._update(
                 event,
                 cards.result_card(

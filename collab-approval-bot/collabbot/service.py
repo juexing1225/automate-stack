@@ -173,7 +173,7 @@ class Service:
                     stderr=subprocess.DEVNULL,
                     text=True,
                     bufsize=1,
-                    env=self.config.child_env(),
+                    env=self.config.child_env(include_lark=True),
                 )
             except OSError as exc:
                 self.logger.error("启动事件消费失败（%s）：%s", key, exc)
@@ -339,8 +339,14 @@ class Service:
         for record in self.store.feishu_records():
             if record.get("closed"):
                 continue
-            message_id = record.get("message_id") or ""
-            if not message_id:
+            mids = []
+            for mid in record.get("message_ids") or []:
+                if mid and mid not in mids:
+                    mids.append(mid)
+            single = record.get("message_id") or ""
+            if single and single not in mids:
+                mids.append(single)
+            if not mids:
                 continue
             target = record.get("target") or "pr"
             number = record.get("number")
@@ -357,6 +363,7 @@ class Service:
                             % (number, state),
                             True,
                             pr=number,
+                            terminal=True,
                             epoch=self.store.epoch,
                         )
                     elif sha and head and sha.lower() != head.lower():
@@ -379,11 +386,13 @@ class Service:
                         "✅ 外部闭环（GitHub/CLI）",
                         "Issue #%s 当前状态 %s，本卡已归档。" % (number, state),
                         True,
+                        terminal=True,
                         epoch=self.store.epoch,
                     )
-                self.lark.patch_card(message_id, patch)
-                # 刷灰成功后标记 closed，后续轮询跳过，避免每 2 分钟无限重复 PATCH。
-                self.store.mark_feishu_closed(target, number, sha)
+                for mid in mids:
+                    self.lark.patch_card(mid, patch)
+                # 全部卡片刷灰成功后标记 closed，后续轮询跳过，避免每 2 分钟无限重复 PATCH。
+                self.store.mark_feishu_closed(target, number, sha, source="external")
                 self.audit.write("system", "patch:closed", "%s #%s" % (target, number))
             except Exception as exc:
                 self.logger.warning("对账刷灰失败（%s #%s）：%s", target, number, exc)
@@ -484,6 +493,16 @@ class Service:
             for line in fatal:
                 self.logger.error("%s", line)
                 print("✖ " + line)
+            lark_ready = any("飞书接口已连通" in n for n in notes)
+            if lark_ready and self.store.owners:
+                alert = "**Collab 审批官启动预检失败（已退出）**\n\n" + "\n".join(
+                    "- " + item for item in fatal
+                )
+                for owner in self.store.owners:
+                    try:
+                        self.lark.send_markdown(owner, alert)
+                    except Exception as exc:
+                        self.logger.warning("发送启动预检告警失败：%s", exc)
             return 2
 
         print("=" * 64)

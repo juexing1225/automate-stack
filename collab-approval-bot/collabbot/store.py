@@ -215,24 +215,41 @@ class Store:
         with self._lock:
             feishu = self.data.setdefault("feishu", {})
             key = "%s:%s:%s" % (target, number, sha)
+            existing = feishu.get(key) if isinstance(feishu.get(key), dict) else {}
+            mids = []
+            for old in existing.get("message_ids") or []:
+                if old and old not in mids:
+                    mids.append(old)
+            old_single = existing.get("message_id") or ""
+            if old_single and old_single not in mids:
+                mids.append(old_single)
+            if message_id and message_id not in mids:
+                mids.append(message_id)
             feishu[key] = {
                 "target": target,
                 "number": number,
                 "sha": sha,
-                "message_id": message_id,
+                "message_id": message_id or old_single,
+                "message_ids": mids,
                 "kind": kind,
                 "closed": False,
             }
             self._save()
 
-    def mark_feishu_closed(self, target: str, number: int, sha: str) -> None:
-        """把已刷灰（外部闭环）的卡片记录标记为 closed，后续对账跳过，避免无限重复 PATCH。"""
+    def mark_feishu_closed(self, target: str, number: int, sha: str, source: str = "") -> None:
+        """把已闭环的飞书记录标记为 closed，后续对账跳过，避免无限重复 PATCH。
+
+        source="internal" 表示手机端 accept_merge 内部闭环；"external"/空表示外部 CLI/GitHub 闭环。
+        G3-02：内部闭环必须落盘来源，否则对账会把手机合并误标为「外部闭环」。
+        """
         with self._lock:
             feishu = self.data.setdefault("feishu", {})
             key = "%s:%s:%s" % (target, number, sha)
             record = feishu.get(key)
             if record is not None:
                 record["closed"] = True
+                if source:
+                    record["closure_source"] = source
                 self._save()
 
     def feishu_records(self) -> list:

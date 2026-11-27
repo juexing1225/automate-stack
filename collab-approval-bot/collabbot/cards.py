@@ -261,6 +261,7 @@ def result_card(
     epoch: str = "",
     retry_labels_issue=None,
     retry_labels_sha=None,
+    terminal: bool = False,
 ) -> dict:
     template = "green" if ok else ("red" if not warning else "orange")
     body = (detail or "（无输出）").strip()
@@ -290,7 +291,8 @@ def result_card(
                 "primary",
             )
         )
-    if pr is not None:
+    # 终态卡（已闭环）不再提供任何操作按钮：刷新/重试都已无意义，避免归档卡继续可点。
+    if not terminal and pr is not None:
         actions.append(_button("刷新卡片", {"a": "refresh", "pr": pr, "epoch": epoch}))
     if actions:
         elements += [{"tag": "hr"}, {"tag": "action", "actions": actions}]

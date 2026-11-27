@@ -23,7 +23,7 @@ class Lark:
                 text=True,
                 capture_output=True,
                 timeout=timeout,
-                env=self.config.child_env(),
+                env=self.config.child_env(include_lark=True),
             )
         except FileNotFoundError as exc:
             raise LarkError(

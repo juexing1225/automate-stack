@@ -96,9 +96,10 @@ class Config:
     def collab_py(self) -> Path:
         return self.repo / "scripts" / "collab.py"
 
-    def child_env(self) -> dict:
-        # 白名单最小环境：只透传运行 collab.py / gh / git / lark-cli 所需的变量，
-        # 剥离 FEISHU_APP_SECRET、COLLAB_BOT_*、LARKSUITE_CLI_CONFIG_DIR 等桥接敏感变量。
+    def child_env(self, include_lark: bool = False) -> dict:
+        # 白名单最小环境：只透传运行 collab.py / gh / git 所需的变量，
+        # 剥离 FEISHU_APP_SECRET、COLLAB_BOT_*、LARKSUITE_CLI_CONFIG_DIR 等桥接敏感变量；
+        # 仅在显式调用 lark-cli 时传入 include_lark=True 注入飞书配置目录。
         keep = {
             "PATH",
             "HOME",
@@ -110,7 +111,8 @@ class Config:
             "SSH_AUTH_SOCK",
         }
         env = {k: v for k, v in os.environ.items() if k in keep and v}
-        env["LARKSUITE_CLI_CONFIG_DIR"] = self.lark_config_dir
+        if include_lark:
+            env["LARKSUITE_CLI_CONFIG_DIR"] = self.lark_config_dir
         base = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         current = env.get("PATH", "")
         env["PATH"] = base + (":" + current if current else "")
