@@ -22,6 +22,7 @@ from collabbot import cards
 from collabbot.collab_actions import Collab, Result
 from collabbot.config import Config
 from collabbot.router import Router
+from collabbot.service import Service
 from collabbot.store import Store
 
 MAX_BYTES = 28672
@@ -47,6 +48,17 @@ def _make_router(store=None, collab=None, audit=None, lark=None):
     audit = audit or Mock()
     lark = lark or Mock()
     return Router(Mock(), store, audit, lark, collab, logging.getLogger("collabbot.tests"))
+
+
+def _make_service(store=None, collab=None, audit=None, lark=None):
+    """绕过完整 __init__，只装配对账路径所需的依赖。"""
+    svc = Service.__new__(Service)
+    svc.store = store or Mock()
+    svc.collab = collab or Mock()
+    svc.audit = audit or Mock()
+    svc.lark = lark or Mock()
+    svc.logger = logging.getLogger("collabbot.tests")
+    return svc
 
 
 class NonOwnerDenialTest(unittest.TestCase):
@@ -173,7 +185,14 @@ class ConcurrencyMutexTest(unittest.TestCase):
                 return {
                     "event_id": eid,
                     "operator_id": "ou_owner",
-                    "action": {"value": {"a": "accept_merge", "pr": 2, "sha": "abc123"}},
+                    "action": {
+                        "value": {
+                            "a": "accept_merge",
+                            "pr": 2,
+                            "sha": "abc123",
+                            "epoch": store.epoch,
+                        }
+                    },
                 }
 
             t1 = threading.Thread(target=router._handle_card, args=(ev("e1"),))
@@ -208,34 +227,7 @@ class ReworkTest(unittest.TestCase):
         self.assertIn("未找到关联工单", r.title)
         self.assertIn("未找到关联工单", r.detail)
 
-    def test_rework_label_failure_lists_failed(self):
-        c = _make_collab()
-        c.pr_view = Mock(
-            return_value={
-                "state": "OPEN",
-                "headRefOid": "abc123",
-                "body": "fix collab:issue 9",
-                "comments": [],
-            }
-        )
-        c.repo_slug = Mock(return_value="owner/repo")
-        c._gh = Mock(
-            side_effect=[
-                (0, "comment ok"),      # pr comment
-                (1, "label add failed"),  # add status:rework
-                (0, ""),                # remove status:review
-                (0, ""),                # remove status:ready-to-merge
-                (0, ""),                # remove review:agent-passed
-            ]
-        )
-        r = c.rework(5, "意见", "abc123")
-        self.assertFalse(r.ok)
-        self.assertTrue(r.warning)
-        self.assertIn("工单标签未完全切换", r.title)
-        self.assertIn("失败", r.detail)
-        self.assertIn("status:rework", r.detail)
-
-    def test_rework_all_labels_ok_succeeds(self):
+    def test_rework_add_label_failure_preserves_state(self):
         c = _make_collab()
         c.pr_view = Mock(
             return_value={
@@ -246,10 +238,59 @@ class ReworkTest(unittest.TestCase):
             }
         )
         c.repo_slug = Mock(return_value="owner/repo")
+        c.issue_view = Mock(
+            return_value={"number": 9, "labels": [{"name": "status:review"}]}
+        )
+        c._gh = Mock(
+            side_effect=[
+                (0, "comment ok"),      # pr comment
+                (1, "label add failed"),  # add status:rework
+            ]
+        )
+        r = c.rework(5, "意见", "abc123")
+        self.assertFalse(r.ok)
+        self.assertTrue(r.warning)
+        self.assertEqual(r.retry_labels_issue, 9)
+        self.assertIn("原状态标签已保留", r.detail)
+        # 加标失败后立即中止：不得移除任何旧状态标签
+        remove_calls = [a for a in c._gh.call_args_list if "--remove-label" in a.args[0]]
+        self.assertEqual(remove_calls, [])
+
+    def test_rework_missing_label_not_removed(self):
+        # 工单只有 status:review，缺 ready-to-merge / agent-passed：缺失标签不应被移除也不误报失败。
+        c = _make_collab()
+        c.pr_view = Mock(
+            return_value={
+                "state": "OPEN",
+                "headRefOid": "abc123",
+                "body": "collab:issue 9",
+                "comments": [],
+            }
+        )
+        c.repo_slug = Mock(return_value="owner/repo")
+        c.issue_view = Mock(
+            return_value={"number": 9, "labels": [{"name": "status:review"}]}
+        )
         c._gh = Mock(return_value=(0, ""))
         r = c.rework(5, "意见", "abc123")
         self.assertTrue(r.ok)
         self.assertIn("已打回返工", r.title)
+        remove_calls = [a for a in c._gh.call_args_list if "--remove-label" in a.args[0]]
+        removed_labels = [a.args[0][-1] for a in remove_calls]
+        self.assertEqual(removed_labels, ["status:review"])
+
+    def test_sync_rework_labels_no_recomment(self):
+        # 幂等补切标签：复用原返工决定，只补标签，绝不重发 PR 评论。
+        c = _make_collab()
+        c.issue_view = Mock(
+            return_value={"number": 9, "labels": [{"name": "status:review"}]}
+        )
+        c._gh = Mock(return_value=(0, ""))
+        r = c.sync_rework_labels(5, 9)
+        self.assertTrue(r.ok)
+        self.assertIn("标签已同步", r.title)
+        comment_calls = [a for a in c._gh.call_args_list if a.args[0][0] == "pr"]
+        self.assertEqual(comment_calls, [])
 
     def test_rework_sha_drift_writes_no_comment(self):
         c = _make_collab()
@@ -372,6 +413,158 @@ class ChildEnvTest(unittest.TestCase):
         self.assertNotIn("COLLAB_BOT_HOME", env)
         self.assertIn("PATH", env)
         self.assertIn("HOME", env)
+
+
+class ConfirmStructureTest(unittest.TestCase):
+    def test_high_risk_confirm_plain_text(self):
+        pr = {
+            "number": 2,
+            "headRefOid": "b" * 40,
+            "title": "t",
+            "changedFiles": 3,
+            "additions": 10,
+            "deletions": 2,
+            "author": {"login": "a"},
+        }
+        issue = {"number": 9, "title": "i", "labels": [{"name": "risk:high"}]}
+        card = cards.approval_card(pr, issue, {})
+        confirm = None
+        for el in card.get("elements", []):
+            if el.get("tag") == "action":
+                for btn in el.get("actions", []):
+                    if btn.get("text", {}).get("content") == "通过并合并":
+                        confirm = btn.get("confirm")
+        self.assertIsNotNone(confirm, "高危合并按钮应带 confirm")
+        self.assertEqual(confirm["title"]["tag"], "plain_text")
+        self.assertEqual(confirm["text"]["tag"], "plain_text")
+
+
+class OverviewDigestTest(unittest.TestCase):
+    def test_digest_stable_and_changes_on_business_data(self):
+        counts = {"ready": 1, "in-progress": 0, "review": 2, "ready-to-merge": 0,
+                  "rework": 0, "draft": 0, "blocked": 1}
+        pending = [{"number": 2, "title": "t", "headRefOid": "c" * 7}]
+        self.assertEqual(cards.overview_digest(counts, pending),
+                         cards.overview_digest(counts, pending))
+        changed = dict(counts)
+        changed["ready"] = 2
+        self.assertNotEqual(cards.overview_digest(counts, pending),
+                            cards.overview_digest(changed, pending))
+
+    def test_overview_card_has_refresh_button(self):
+        card = cards.overview_card({}, [], updated_at="x", epoch="e1")
+        self.assertIn("refresh_overview", json.dumps(card, ensure_ascii=False))
+        archived = cards.overview_card({}, [], archived=True)
+        self.assertNotIn("refresh_overview", json.dumps(archived, ensure_ascii=False))
+
+    def test_overview_no_change_no_patch(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.json")
+            store.add_owner("ou_owner")
+            collab = Mock()
+            collab.overview_data.return_value = (
+                {"ready": 1, "in-progress": 0, "review": 0, "ready-to-merge": 0,
+                 "rework": 0, "draft": 0, "blocked": 0},
+                [],
+            )
+            lark = Mock()
+            lark.send_card.return_value = "mid-c0"
+            svc = _make_service(store=store, collab=collab, lark=lark, audit=Mock())
+            for _ in range(3):
+                svc._reconcile_overview(["ou_owner"])
+            self.assertEqual(lark.send_card.call_count, 1)
+            self.assertEqual(lark.patch_card.call_count, 0)
+
+
+class RebuildNotifiedTest(unittest.TestCase):
+    def test_rebuild_writes_notified_and_no_resend(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.json")
+            store.add_owner("ou_owner")
+            collab = Mock()
+            collab.approval_items.return_value = [
+                {"pr": {"number": 7, "headRefOid": "abc123"}, "issue": {}}
+            ]
+            collab.blocked_issues.return_value = [
+                {"issue": {"number": 9}, "kind": "blocked:needs-human"}
+            ]
+            collab.read_feishu_msg.side_effect = lambda target, n: (
+                [{"message_id": "mid-1", "sha": "abc123", "kind": "C1"}]
+                if target == "pr"
+                else [{"message_id": "mid-2", "kind": "C2"}]
+            )
+            lark = Mock()
+            svc = _make_service(store=store, collab=collab, lark=lark, audit=Mock())
+            svc._rebuild_feishu_from_github()
+            svc._reconcile_approvals(["ou_owner"])
+            svc._reconcile_blocked(["ou_owner"])
+            # 重建后 feishu 记录与 notified 去重键都补齐，C1/C2 不再重发
+            self.assertEqual(len(store.feishu_records()), 2)
+            self.assertTrue(store.is_notified("pr:7:abc123"))
+            self.assertTrue(store.is_notified("issue:9:blocked:needs-human"))
+            self.assertEqual(lark.send_card.call_count, 0)
+
+
+class ClosureArchiveTest(unittest.TestCase):
+    def test_closed_pr_patches_once(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.json")
+            store.add_owner("ou_owner")
+            store.remember_feishu("pr", 2, "abc123", "mid-1", "C1")
+            collab = Mock()
+            collab.pr_view.return_value = {"state": "MERGED", "headRefOid": "abc123"}
+            lark = Mock()
+            svc = _make_service(store=store, collab=collab, lark=lark, audit=Mock())
+            for _ in range(3):
+                svc._reconcile_closures()
+            self.assertEqual(lark.patch_card.call_count, 1)
+
+
+class EpochValidationTest(unittest.TestCase):
+    def test_stale_epoch_rejected_zero_writes(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.json")
+            store.add_owner("ou_owner")
+            audit = Mock()
+            lark = Mock()
+            collab = Mock()
+            router = _make_router(store=store, collab=collab, audit=audit, lark=lark)
+            event = {
+                "event_id": "evt-old",
+                "operator_id": "ou_owner",
+                "action": {
+                    "value": {
+                        "a": "accept_merge",
+                        "pr": 2,
+                        "sha": "abc123",
+                        "epoch": "deadbeef-stale",
+                    }
+                },
+            }
+            router._handle_card(event)
+            collab.pr_view.assert_not_called()
+            collab.accept_and_merge.assert_not_called()
+            deny = [c for c in audit.write.call_args_list if c.args[1] == "card:accept_merge"]
+            self.assertTrue(deny)
+            self.assertEqual(deny[0].args[3], "stale-epoch")
+
+
+class OverviewRotationTest(unittest.TestCase):
+    def test_rotation_sends_to_all_owners_with_pointer(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.json")
+            collab = Mock()
+            collab.overview_data.return_value = (
+                {"ready": 0, "in-progress": 0, "review": 0, "ready-to-merge": 0,
+                 "rework": 0, "draft": 0, "blocked": 0},
+                [],
+            )
+            lark = Mock()
+            lark.send_card.side_effect = ["mid-a", "mid-b"]
+            svc = _make_service(store=store, collab=collab, lark=lark, audit=Mock())
+            svc._reconcile_overview(["ou_a", "ou_b"])
+            self.assertEqual(lark.send_card.call_count, 2)
+            self.assertEqual(lark.send_markdown.call_count, 2)
 
 
 if __name__ == "__main__":

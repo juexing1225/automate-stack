@@ -64,6 +64,7 @@ class Result:
     detail: str = ""
     retry_sha: Optional[str] = None
     warning: bool = False
+    retry_labels_issue: Optional[int] = None
 
 
 class Collab:
@@ -242,6 +243,27 @@ class Collab:
                     break
         return items
 
+    def overview_data(self):
+        """C0 总览卡业务状态载荷：各阶段计数 + 待终审 PR 列表。"""
+        counts = {
+            "ready": 0,
+            "in-progress": 0,
+            "review": 0,
+            "ready-to-merge": 0,
+            "rework": 0,
+            "draft": 0,
+            "blocked": 0,
+        }
+        for issue in self.open_issues():
+            labels = self.label_names(issue)
+            for key in ("ready", "in-progress", "review", "ready-to-merge", "rework", "draft"):
+                if ("status:" + key) in labels:
+                    counts[key] += 1
+            if "blocked:needs-human" in labels or "blocked:needs-design" in labels:
+                counts["blocked"] += 1
+        pending = [item.get("pr") or {} for item in self.approval_items()]
+        return counts, pending
+
     # ---------- 人类动作 ----------
 
     def _check_expected_sha(self, number: int, expected_sha: str):
@@ -379,17 +401,46 @@ class Collab:
             )
             return Result(False, "已写返工评论，但未找到关联工单", detail, warning=True)
 
+        return self._apply_rework_labels(number, issue_no, output, commented=True)
+
+    def sync_rework_labels(self, number: int, issue_no: int) -> Result:
+        """幂等补切标签：复用原返工决定，仅补加/移除标签，绝不重发 PR 评论。"""
+        return self._apply_rework_labels(number, issue_no, "", commented=False)
+
+    def _apply_rework_labels(self, number, issue_no, comment_output, commented) -> Result:
+        # 先读当前标签集合，仅移除实际存在的旧状态标签，避免对不存在标签报错而误报失败。
+        try:
+            issue = self.issue_view(issue_no)
+        except RuntimeError:
+            issue = {}
+        current_labels = set(self.label_names(issue))
+
         done = []
         failed = []
-        rc2, out2 = self._gh(
-            ["issue", "edit", str(issue_no), "--add-label", "status:rework"]
-        )
-        target = done if rc2 == 0 else failed
-        target.append(
-            "工单 #%s 加 status:rework：%s"
-            % (issue_no, "成功" if rc2 == 0 else "失败（%s）" % out2)
-        )
+        # ① 先加 status:rework；失败立即中止，绝不移除原状态标签，保留工单可派单状态。
+        if "status:rework" not in current_labels:
+            rc2, out2 = self._gh(
+                ["issue", "edit", str(issue_no), "--add-label", "status:rework"]
+            )
+            if rc2 != 0:
+                detail = (
+                    "⚠️ 给工单 #%s 加 status:rework 失败，原状态标签已保留（未做任何移除）。"
+                    "请点击「重试同步标签」仅补切标签，不会重复写返工评论。"
+                ) % issue_no
+                if commented:
+                    detail = comment_output + "\n\n" + detail
+                return Result(
+                    False,
+                    "⚠️ 评论已写，但工单标签切换失败（原状态保留）" if commented else "⚠️ 工单标签切换失败（原状态保留）",
+                    detail,
+                    warning=True,
+                    retry_labels_issue=issue_no,
+                )
+            done.append("工单 #%s 加 status:rework：成功" % issue_no)
+        # ② 仅移除实际存在的旧状态标签。
         for label in ("status:review", "status:ready-to-merge", "review:agent-passed"):
+            if label not in current_labels:
+                continue
             rc3, out3 = self._gh(
                 ["issue", "edit", str(issue_no), "--remove-label", label]
             )
@@ -398,7 +449,9 @@ class Collab:
                 "移除 %s：%s" % (label, "成功" if rc3 == 0 else "失败（%s）" % out3)
             )
 
-        detail_lines = [output, ""]
+        detail_lines = [comment_output] if commented and comment_output else []
+        if detail_lines:
+            detail_lines.append("")
         if done:
             detail_lines.append("已完成：")
             detail_lines.extend("- " + item for item in done)
@@ -409,9 +462,17 @@ class Collab:
 
         if failed:
             return Result(
-                False, "⚠️ 评论已写，但工单标签未完全切换", detail, warning=True
+                False,
+                "⚠️ 评论已写，但工单标签未完全同步" if commented else "⚠️ 工单标签仍未完全同步",
+                detail,
+                warning=True,
+                retry_labels_issue=issue_no,
             )
-        return Result(True, "🔁 已打回返工", detail)
+        return Result(
+            True,
+            "🔁 已打回返工" if commented else "✅ 标签已同步",
+            detail,
+        )
 
     def pack(self, kind: str, number: int) -> Result:
         rc, output = self.run_collab(["pack", kind, str(number)])

@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import fcntl
-import hashlib
 import json
 import logging
 import os
@@ -255,15 +254,22 @@ class Service:
             number = pr.get("number")
             for kv in self.collab.read_feishu_msg("pr", number):
                 mid = kv.get("message_id") or ""
+                sha = kv.get("sha") or ""
                 if mid:
-                    self.store.remember_feishu("pr", number, kv.get("sha") or "", mid, kv.get("kind") or "C1")
+                    self.store.remember_feishu("pr", number, sha, mid, kv.get("kind") or "C1")
+                    # 同步写入 notified 去重键，避免删缓存重启后对同 SHA 重复发 C1。
+                    if sha:
+                        self.store.once("pr:%s:%s" % (number, sha))
         for item in self.collab.blocked_issues():
             issue = item.get("issue") or {}
             number = issue.get("number")
+            kind = item.get("kind") or "blocked:needs-human"
             for kv in self.collab.read_feishu_msg("issue", number):
                 mid = kv.get("message_id") or ""
                 if mid:
                     self.store.remember_feishu("issue", number, "", mid, kv.get("kind") or "C2")
+                    # 同步写入 notified 去重键，避免删缓存重启后对同 kind 重复发 C2。
+                    self.store.once("issue:%s:%s" % (number, kind))
 
     def _reconcile_approvals(self, owners) -> None:
         for item in self.collab.approval_items():
@@ -289,6 +295,7 @@ class Service:
                 item.get("issue") or {},
                 review,
                 warning="检测到待你终审的 PR。",
+                epoch=self.store.epoch,
             )
             sent = 0
             for owner in owners:
@@ -330,6 +337,8 @@ class Service:
     def _reconcile_closures(self) -> None:
         """PR/Issue 已合并/关闭或 headRefOid 变更时，把旧卡刷灰，绝不写入人类批准结论。"""
         for record in self.store.feishu_records():
+            if record.get("closed"):
+                continue
             message_id = record.get("message_id") or ""
             if not message_id:
                 continue
@@ -348,6 +357,7 @@ class Service:
                             % (number, state),
                             True,
                             pr=number,
+                            epoch=self.store.epoch,
                         )
                     elif sha and head and sha.lower() != head.lower():
                         patch = cards.result_card(
@@ -356,6 +366,7 @@ class Service:
                             % (sha[:7], head[:7]),
                             False,
                             pr=number,
+                            epoch=self.store.epoch,
                         )
                     else:
                         continue
@@ -368,44 +379,30 @@ class Service:
                         "✅ 外部闭环（GitHub/CLI）",
                         "Issue #%s 当前状态 %s，本卡已归档。" % (number, state),
                         True,
+                        epoch=self.store.epoch,
                     )
                 self.lark.patch_card(message_id, patch)
+                # 刷灰成功后标记 closed，后续轮询跳过，避免每 2 分钟无限重复 PATCH。
+                self.store.mark_feishu_closed(target, number, sha)
                 self.audit.write("system", "patch:closed", "%s #%s" % (target, number))
             except Exception as exc:
                 self.logger.warning("对账刷灰失败（%s #%s）：%s", target, number, exc)
 
     def _overview_data(self):
-        counts = {
-            "ready": 0,
-            "in-progress": 0,
-            "review": 0,
-            "ready-to-merge": 0,
-            "rework": 0,
-            "draft": 0,
-            "blocked": 0,
-        }
-        for issue in self.collab.open_issues():
-            labels = self.collab.label_names(issue)
-            for key in ("ready", "in-progress", "review", "ready-to-merge", "rework", "draft"):
-                if ("status:" + key) in labels:
-                    counts[key] += 1
-            if "blocked:needs-human" in labels or "blocked:needs-design" in labels:
-                counts["blocked"] += 1
-        pending = [item.get("pr") or {} for item in self.collab.approval_items()]
-        return counts, pending
+        return self.collab.overview_data()
 
     def _reconcile_overview(self, owners) -> None:
         counts, pending = self._overview_data()
         updated_at = time.strftime("%Y-%m-%d %H:%M:%S")
-        card = cards.overview_card(counts, pending, updated_at=updated_at)
-        digest = hashlib.sha256(
-            json.dumps(card, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        ).hexdigest()
+        digest = cards.overview_digest(counts, pending)
+        card = cards.overview_card(
+            counts, pending, updated_at=updated_at, epoch=self.store.epoch
+        )
         state = self.store.overview_state()
         message_id = state.get("message_id") or ""
         first_sent = state.get("first_sent") or 0
         if state.get("hash") == digest and message_id:
-            return  # 内容无变化，不调用 PATCH
+            return  # 业务状态无变化，不调用 PATCH
 
         now = time.time()
         if not message_id or now - first_sent >= 13 * 86400:
@@ -417,15 +414,28 @@ class Service:
                     )
                 except Exception as exc:
                     self.logger.warning("归档旧总览卡失败：%s", exc)
+            # 轮换新 C0：遍历发送给全部 owners（不再只发第 1 个）。
+            new_message_ids = {}
             for owner in owners:
                 try:
                     new_mid = self.lark.send_card(owner, card)
                     if new_mid:
-                        message_id = new_mid
-                        first_sent = now
-                        break
+                        new_message_ids[owner] = new_mid
                 except Exception as exc:
                     self.logger.warning("发送总览卡失败：%s", exc)
+            if new_message_ids:
+                message_id = next(iter(new_message_ids.values()))
+                first_sent = now
+                # 无置顶权兜底：向会话发送指向新卡 message_id 的明确指引。
+                for owner, mid in new_message_ids.items():
+                    try:
+                        self.lark.send_markdown(
+                            owner,
+                            "已更新协作总览卡（`%s`）。若未置顶，请手动置顶或向上翻看最新卡片。"
+                            % mid,
+                        )
+                    except Exception as exc:
+                        self.logger.warning("发送总览指引失败：%s", exc)
         else:
             try:
                 self.lark.patch_card(message_id, card)

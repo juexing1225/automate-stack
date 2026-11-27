@@ -216,18 +216,20 @@ class Router:
             self._reply(open_id, text)
             if "review:agent-passed" in self.collab.label_names(issue):
                 self.lark.send_card(
-                    open_id, cards.approval_card(pr, issue, review)
+                    open_id, cards.approval_card(pr, issue, review, epoch=self.store.epoch)
                 )
             return
 
         if cmd == "card":
             self.audit.write(open_id, "/card", str(number))
-            self.lark.send_card(open_id, cards.approval_card(pr, issue, review))
+            self.lark.send_card(
+                open_id, cards.approval_card(pr, issue, review, epoch=self.store.epoch)
+            )
             return
 
         if cmd == "approve":
             self.audit.write(open_id, "/approve", str(number))
-            self.lark.send_card(open_id, cards.confirm_card(pr))
+            self.lark.send_card(open_id, cards.confirm_card(pr, epoch=self.store.epoch))
             return
 
         if cmd == "rework":
@@ -243,7 +245,13 @@ class Router:
             self.lark.send_card(
                 open_id,
                 cards.result_card(
-                    result.title, result.detail, result.ok, pr=number, warning=result.warning
+                    result.title,
+                    result.detail,
+                    result.ok,
+                    pr=number,
+                    warning=result.warning,
+                    epoch=self.store.epoch,
+                    retry_labels_issue=result.retry_labels_issue,
                 ),
             )
 
@@ -305,7 +313,7 @@ class Router:
         except (TypeError, ValueError):
             number = 0
         sha = str(value.get("sha") or "")
-        if number <= 0 and len(encoded) == 3:
+        if number <= 0 and len(encoded) >= 3:
             try:
                 number = int(encoded[1])
             except (TypeError, ValueError):
@@ -317,11 +325,26 @@ class Router:
             self._update(
                 event,
                 cards.result_card(
-                    "已取消", "没有执行任何变更。", True, pr=number or None
+                    "已取消", "没有执行任何变更。", True, pr=number or None, epoch=self.store.epoch
                 ),
                 "已取消，没有执行任何变更。",
                 operator,
             )
+            return
+
+        if name == "refresh_overview":
+            # C0「↻ 立即刷新」：即时重算业务状态并原地回刷，不涉及任何 GitHub 写入。
+            try:
+                counts, pending = self.collab.overview_data()
+            except Exception as exc:
+                self.logger.warning("刷新总览失败：%s", exc)
+                counts, pending = {}, []
+            updated_at = time.strftime("%Y-%m-%d %H:%M:%S")
+            card = cards.overview_card(
+                counts, pending, updated_at=updated_at, epoch=self.store.epoch
+            )
+            self.audit.write(operator, "card:refresh_overview", "", "ok")
+            self._update(event, card, "已刷新总览。", operator)
             return
 
         if number <= 0:
@@ -332,6 +355,26 @@ class Router:
                 operator,
             )
             return
+
+        # 实例纪元校验：缓存全丢重启后 boot_epoch 会换新，旧卡按钮必须安全拒绝（0 GitHub 写入）。
+        if name in ("accept_merge", "accept_only", "rework", "retry_merge", "retry_labels"):
+            card_epoch = str(value.get("epoch") or "")
+            if not card_epoch and len(encoded) >= 4:
+                card_epoch = encoded[3]
+            if self.store.epoch and card_epoch != self.store.epoch:
+                self.audit.write(operator, "card:" + name, str(number), "stale-epoch")
+                self._update(
+                    event,
+                    cards.result_card(
+                        "卡片已过期",
+                        "实例已重启，本卡片已失效。请获取最新卡片后重新操作（未做任何变更）。",
+                        False,
+                        pr=number,
+                    ),
+                    "实例已重启，卡片已过期，请获取最新卡片。",
+                    operator,
+                )
+                return
 
         started = time.time()
         try:
@@ -391,6 +434,7 @@ class Router:
                     review,
                     warning="PR 已有新提交（卡片 %s → 当前 %s），请重新确认。"
                     % (sha[:7], current_sha[:7]),
+                    epoch=self.store.epoch,
                 )
                 self._update(
                     event,
@@ -412,7 +456,7 @@ class Router:
                     issue = {}
             review = self.collab.latest_review(pr)
             card = cards.approval_card(
-                pr, issue, review, warning="已刷新为当前最新 SHA。"
+                pr, issue, review, warning="已刷新为当前最新 SHA。", epoch=self.store.epoch
             )
             self._update(event, card, "已刷新，请查看新卡片。", operator)
             return
@@ -452,6 +496,7 @@ class Router:
                     pr=number,
                     retry_sha=result.retry_sha,
                     warning=not result.ok,
+                    epoch=self.store.epoch,
                 ),
                 "%s\n\n%s" % (result.title, result.detail[:2500]),
                 operator,
@@ -473,7 +518,8 @@ class Router:
             self._update(
                 event,
                 cards.result_card(
-                    result.title, result.detail, result.ok, pr=number, warning=not result.ok
+                    result.title, result.detail, result.ok, pr=number, warning=not result.ok,
+                    epoch=self.store.epoch,
                 ),
                 "%s\n\n%s" % (result.title, result.detail[:2500]),
                 operator,
@@ -501,6 +547,50 @@ class Router:
                     pr=number,
                     retry_sha=result.retry_sha,
                     warning=not result.ok,
+                    epoch=self.store.epoch,
+                ),
+                "%s\n\n%s" % (result.title, result.detail[:2500]),
+                operator,
+            )
+            return
+
+        if name == "retry_labels":
+            # 幂等补切标签：复用原返工决定，只补标签，绝不重发 REWORK 评论。
+            issue_no = value.get("issue")
+            try:
+                issue_no = int(issue_no)
+            except (TypeError, ValueError):
+                issue_no = 0
+            if issue_no <= 0:
+                self._update(
+                    event,
+                    cards.result_card("操作无效", "卡片缺少工单编号，请重新生成。", False, pr=number),
+                    "卡片缺少工单编号，请重新生成。",
+                    operator,
+                )
+                return
+            decision_key = self._decision_key(number, sha)
+            if not self.store.decision_in_progress(decision_key):
+                self._conflict_update(event, operator, number)
+                return
+            try:
+                result = self.collab.sync_rework_labels(number, issue_no)
+            finally:
+                self.store.finish_decision(decision_key)
+            self.audit.write(
+                operator, "card:retry_labels", "%s #%s" % (number, issue_no),
+                "ok" if result.ok else "fail",
+            )
+            self._update(
+                event,
+                cards.result_card(
+                    result.title,
+                    result.detail,
+                    result.ok,
+                    pr=number,
+                    warning=not result.ok,
+                    epoch=self.store.epoch,
+                    retry_labels_issue=issue_no if result.retry_labels_issue else None,
                 ),
                 "%s\n\n%s" % (result.title, result.detail[:2500]),
                 operator,
@@ -536,6 +626,7 @@ class Router:
                         self.collab.latest_review(pr),
                         warning="打回返工必须填写意见。也可以在聊天里发 /rework %s 意见"
                         % number,
+                        epoch=self.store.epoch,
                     ),
                     "打回返工必须填写意见。",
                     operator,
@@ -556,7 +647,13 @@ class Router:
             self._update(
                 event,
                 cards.result_card(
-                    result.title, result.detail, result.ok, pr=number, warning=result.warning
+                    result.title,
+                    result.detail,
+                    result.ok,
+                    pr=number,
+                    warning=result.warning,
+                    epoch=self.store.epoch,
+                    retry_labels_issue=result.retry_labels_issue,
                 ),
                 "%s\n\n%s" % (result.title, result.detail[:2500]),
                 operator,

@@ -20,6 +20,10 @@ def _new_bind_code() -> str:
     return "".join(secrets.choice(ALPHABET) for _ in range(6))
 
 
+def _new_epoch() -> str:
+    return secrets.token_hex(8)
+
+
 class Store:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
@@ -42,6 +46,7 @@ class Store:
         return {
             "version": 1,
             "bind_code": _new_bind_code(),
+            "boot_epoch": _new_epoch(),
             "owners": [],
             "handled": {},
             "pending": {},
@@ -54,6 +59,8 @@ class Store:
     def _ensure_defaults(self) -> None:
         if not isinstance(self.data.get("bind_code"), str) or not self.data["bind_code"]:
             self.data["bind_code"] = _new_bind_code()
+        if not isinstance(self.data.get("boot_epoch"), str) or not self.data["boot_epoch"]:
+            self.data["boot_epoch"] = _new_epoch()
         for key in ("owners", "handled", "pending", "notified", "decisions", "feishu", "overview"):
             if not isinstance(self.data.get(key), type({} if key != "owners" else [])):
                 self.data[key] = {} if key != "owners" else []
@@ -73,6 +80,12 @@ class Store:
     def bind_code(self) -> str:
         with self._lock:
             return str(self.data["bind_code"])
+
+    @property
+    def epoch(self) -> str:
+        """实例纪元：state.json 新建时生成，缓存全丢重建时自动换新，用于拒绝重启前的旧卡按钮。"""
+        with self._lock:
+            return str(self.data["boot_epoch"])
 
     @property
     def owners(self) -> list:
@@ -201,14 +214,26 @@ class Store:
     def remember_feishu(self, target: str, number: int, sha: str, message_id: str, kind: str) -> None:
         with self._lock:
             feishu = self.data.setdefault("feishu", {})
-            feishu["%s:%s:%s" % (target, number, sha)] = {
+            key = "%s:%s:%s" % (target, number, sha)
+            feishu[key] = {
                 "target": target,
                 "number": number,
                 "sha": sha,
                 "message_id": message_id,
                 "kind": kind,
+                "closed": False,
             }
             self._save()
+
+    def mark_feishu_closed(self, target: str, number: int, sha: str) -> None:
+        """把已刷灰（外部闭环）的卡片记录标记为 closed，后续对账跳过，避免无限重复 PATCH。"""
+        with self._lock:
+            feishu = self.data.setdefault("feishu", {})
+            key = "%s:%s:%s" % (target, number, sha)
+            record = feishu.get(key)
+            if record is not None:
+                record["closed"] = True
+                self._save()
 
     def feishu_records(self) -> list:
         with self._lock:
