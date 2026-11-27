@@ -142,7 +142,7 @@ def approval_card(pr: dict, issue: dict, review: dict, warning: str = "", epoch:
     lines.append("**作者** %s" % author)
     if review:
         lines.append(
-            "**审查** %s · %s · family=%s · `%s`"
+            "**审查** %s · %s · family=%s · %s"
             % (
                 review.get("member", "?"),
                 review.get("verdict", "?"),
@@ -165,7 +165,7 @@ def approval_card(pr: dict, issue: dict, review: dict, warning: str = "", epoch:
         )
     )
     lines.append("**标签** %s" % (", ".join(labels) or "无"))
-    lines.append("**SHA** `%s`" % head)
+    lines.append("**SHA** %s" % head)
     if pr.get("title"):
         lines.append("")
         lines.append("**%s**" % pr.get("title"))
@@ -230,7 +230,7 @@ def confirm_card(pr: dict, epoch: str = "") -> dict:
     content = (
         "确认对 **PR #%s** 执行终审并合并？\n\n"
         "- 标题：%s\n"
-        "- SHA：`%s`\n\n"
+        "- SHA：%s\n\n"
         "将依次执行 `collab.py accept` 与 `gh pr merge --squash "
         "--match-head-commit`。"
     ) % (number, pr.get("title", ""), head)
@@ -260,6 +260,7 @@ def result_card(
     warning: bool = False,
     epoch: str = "",
     retry_labels_issue=None,
+    retry_labels_sha=None,
 ) -> dict:
     template = "green" if ok else ("red" if not warning else "orange")
     body = (detail or "（无输出）").strip()
@@ -279,7 +280,13 @@ def result_card(
         actions.append(
             _button(
                 "重试同步标签",
-                {"a": "retry_labels", "pr": pr, "issue": retry_labels_issue, "epoch": epoch},
+                {
+                    "a": "retry_labels",
+                    "pr": pr,
+                    "issue": retry_labels_issue,
+                    "sha": retry_labels_sha or "",
+                    "epoch": epoch,
+                },
                 "primary",
             )
         )
@@ -332,7 +339,7 @@ def overview_card(counts: dict, pending: list, updated_at: str = "", archived: b
         lines.append("**待你终审（%d）**" % len(pending))
         for pr in pending[:10]:
             lines.append(
-                "- PR #%s %s · `%s`"
+                "- PR #%s %s · %s"
                 % (
                     pr.get("number"),
                     pr.get("title", ""),

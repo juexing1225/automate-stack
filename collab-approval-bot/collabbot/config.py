@@ -11,11 +11,13 @@ DEFAULT_REPO = os.path.join(DEFAULT_MIRROR_ROOT, "collab-mvp-demo")
 def load_env_file(path: str) -> None:
     """加载简单的 KEY=VALUE 文件；已存在的环境变量优先。"""
     file_path = Path(os.path.expanduser(os.path.expandvars(path)))
-    if not file_path.is_file():
-        return
     try:
+        if not file_path.is_file():
+            return
         lines = file_path.read_text("utf-8").splitlines()
     except OSError:
+        # 家目录/沙盒受限下 is_file() 或 read_text() 都可能抛 PermissionError，
+        # 一律按「不可读」忽略，避免仅 import 模块即崩溃。
         return
     for line in lines:
         text = line.strip()
@@ -68,7 +70,6 @@ class Config:
             if item.strip()
         }
         self.allow_group = _flag("COLLAB_BOT_ALLOW_GROUP", False)
-        self.safe_mode = _flag("COLLAB_BOT_SAFE_MODE", True)
         self.cmd_timeout = int(_env("COLLAB_BOT_CMD_TIMEOUT", "120"))
         self.max_output = int(_env("COLLAB_BOT_MAX_OUTPUT", "3800"))
         self.poll_seconds = int(_env("COLLAB_BOT_POLL_SECONDS", "120"))

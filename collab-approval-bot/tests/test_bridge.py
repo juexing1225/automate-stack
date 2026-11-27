@@ -567,5 +567,171 @@ class OverviewRotationTest(unittest.TestCase):
             self.assertEqual(lark.send_markdown.call_count, 2)
 
 
+class ReworkLabelSyncTest(unittest.TestCase):
+    def test_rework_issue_view_failure_fails_closed(self):
+        # R1/C-1：读取工单标签失败严禁静默置空并误报成功。
+        c = _make_collab()
+        c.pr_view = Mock(
+            return_value={
+                "state": "OPEN",
+                "headRefOid": "abc123",
+                "body": "collab:issue 9",
+                "comments": [],
+            }
+        )
+        c.repo_slug = Mock(return_value="owner/repo")
+        c.issue_view = Mock(side_effect=RuntimeError("boom"))
+        c._gh = Mock(return_value=(0, "comment ok"))
+        r = c.rework(5, "意见", "abc123")
+        self.assertFalse(r.ok)
+        self.assertTrue(r.warning)
+        self.assertEqual(r.retry_labels_issue, 9)
+        self.assertEqual(r.retry_labels_sha, "abc123")
+        self.assertIn("读取工单标签失败", r.title)
+        # 读取失败后不得做任何标签写入
+        label_calls = [a for a in c._gh.call_args_list if a.args[0][0] == "issue"]
+        self.assertEqual(label_calls, [])
+        # 仅写 1 条 PR 返工评论，不重复
+        pr_comment_calls = [a for a in c._gh.call_args_list if a.args[0][0] == "pr"]
+        self.assertEqual(len(pr_comment_calls), 1)
+
+    def test_sync_rework_labels_cleans_conflicting_preserves_unrelated(self):
+        # R1/C-1：失败后恢复重试，清除冲突旧状态标签、保留无关标签，且不再重发 PR 评论。
+        c = _make_collab()
+        c.issue_view = Mock(
+            return_value={
+                "number": 9,
+                "labels": [
+                    {"name": "status:review"},
+                    {"name": "foo"},
+                ],
+            }
+        )
+        c._gh = Mock(return_value=(0, ""))
+        r = c.sync_rework_labels(5, 9, "abc123")
+        self.assertTrue(r.ok)
+        self.assertIn("标签已同步", r.title)
+        remove_calls = [a for a in c._gh.call_args_list if "--remove-label" in a.args[0]]
+        removed = [a.args[0][-1] for a in remove_calls]
+        self.assertEqual(removed, ["status:review"])
+        pr_comment_calls = [a for a in c._gh.call_args_list if a.args[0][0] == "pr"]
+        self.assertEqual(pr_comment_calls, [])
+
+
+class RetryLabelsCardTest(unittest.TestCase):
+    def test_retry_labels_button_carries_sha(self):
+        # R2/C-2：重试同步标签按钮必须携带 sha，与 rework/accept_merge 共享互斥键。
+        card = cards.result_card(
+            "标题", "详情", False, pr=2, warning=True,
+            retry_labels_issue=9, retry_labels_sha="abc123", epoch="e1",
+        )
+        found = None
+        for el in card.get("elements", []):
+            if el.get("tag") == "action":
+                for btn in el.get("actions", []):
+                    if btn.get("text", {}).get("content") == "重试同步标签":
+                        found = btn.get("value")
+        self.assertIsNotNone(found)
+        self.assertEqual(found.get("sha"), "abc123")
+        self.assertEqual(found.get("issue"), 9)
+
+
+class RetryLabelsRouterTest(unittest.TestCase):
+    def _retry_event(self, eid, pr, issue, sha, epoch):
+        return {
+            "event_id": eid,
+            "operator_id": "ou_owner",
+            "action": {
+                "value": {"a": "retry_labels", "pr": pr, "issue": issue, "sha": sha, "epoch": epoch}
+            },
+        }
+
+    def test_retry_labels_new_head_zero_write(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.json")
+            store.add_owner("ou_owner")
+            collab = Mock()
+            collab.pr_view.return_value = {"state": "OPEN", "headRefOid": "newsha"}
+            collab.issue_number.return_value = None
+            collab.latest_review.return_value = {}
+            router = _make_router(store=store, collab=collab, audit=Mock(), lark=Mock())
+            router._handle_card(self._retry_event("e1", 2, 9, "oldsha", store.epoch))
+            collab.sync_rework_labels.assert_not_called()
+
+    def test_retry_labels_changed_issue_zero_write(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.json")
+            store.add_owner("ou_owner")
+            collab = Mock()
+            collab.pr_view.return_value = {"state": "OPEN", "headRefOid": "abc123"}
+            collab.issue_number.return_value = 10
+            router = _make_router(store=store, collab=collab, audit=Mock(), lark=Mock())
+            router._handle_card(self._retry_event("e1", 2, 9, "abc123", store.epoch))
+            collab.sync_rework_labels.assert_not_called()
+
+    def test_retry_labels_same_round_only_labels(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.json")
+            store.add_owner("ou_owner")
+            collab = Mock()
+            collab.repo_slug.return_value = "owner/repo"
+            collab.pr_view.return_value = {"state": "OPEN", "headRefOid": "abc123"}
+            collab.issue_number.return_value = 9
+            collab.sync_rework_labels.return_value = Result(True, "✅ 标签已同步", "ok")
+            router = _make_router(store=store, collab=collab, audit=Mock(), lark=Mock())
+            router._handle_card(self._retry_event("e1", 2, 9, "abc123", store.epoch))
+            collab.sync_rework_labels.assert_called_once_with(2, 9, "abc123")
+            collab.rework.assert_not_called()
+
+
+class OverviewRotationExpiryTest(unittest.TestCase):
+    def test_overview_rotation_after_13_days_quiet(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.json")
+            store.add_owner("ou_owner")
+            collab = Mock()
+            collab.overview_data.return_value = (
+                {"ready": 1, "in-progress": 0, "review": 0, "ready-to-merge": 0,
+                 "rework": 0, "draft": 0, "blocked": 0},
+                [],
+            )
+            lark = Mock()
+            lark.send_card.return_value = "mid-new"
+            svc = _make_service(store=store, collab=collab, lark=lark, audit=Mock())
+            svc._reconcile_overview(["ou_owner"])
+            # 手动把 first_sent 拨回 14 天前，业务状态（hash）不变
+            state = store.overview_state()
+            state["first_sent"] = time.time() - 14 * 86400
+            store.save_overview_state(state)
+            svc._reconcile_overview(["ou_owner"])
+            # 满 13 天即使 hash 不变也应归档旧卡 + 发新卡
+            self.assertEqual(lark.send_card.call_count, 2)
+            self.assertGreaterEqual(lark.patch_card.call_count, 1)
+
+    def test_overview_multi_owner_patch_all(self):
+        with TemporaryDirectory() as tmp:
+            store = Store(Path(tmp) / "state.json")
+            collab = Mock()
+            collab.overview_data.return_value = (
+                {"ready": 0, "in-progress": 0, "review": 0, "ready-to-merge": 0,
+                 "rework": 0, "draft": 0, "blocked": 0},
+                [],
+            )
+            lark = Mock()
+            lark.send_card.side_effect = ["mid-a", "mid-b"]
+            svc = _make_service(store=store, collab=collab, lark=lark, audit=Mock())
+            svc._reconcile_overview(["ou_a", "ou_b"])
+            # 业务状态变化 → 更新必须覆盖全部 owner 的卡，不能只刷第 1 个
+            collab.overview_data.return_value = (
+                {"ready": 2, "in-progress": 0, "review": 0, "ready-to-merge": 0,
+                 "rework": 0, "draft": 0, "blocked": 0},
+                [],
+            )
+            lark.reset_mock()
+            svc._reconcile_overview(["ou_a", "ou_b"])
+            self.assertEqual(lark.send_card.call_count, 0)
+            self.assertEqual(lark.patch_card.call_count, 2)
+
+
 if __name__ == "__main__":
     unittest.main()

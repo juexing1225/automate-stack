@@ -391,6 +391,24 @@ class Service:
     def _overview_data(self):
         return self.collab.overview_data()
 
+    @staticmethod
+    def _overview_message_ids(state: dict) -> dict:
+        """向下兼容旧 state 的单个 message_id；新格式为 {owner: mid}。"""
+        message_ids = state.get("message_ids")
+        if isinstance(message_ids, dict):
+            return {k: v for k, v in message_ids.items() if v}
+        legacy = state.get("message_id") or ""
+        if not legacy:
+            return {}
+        # 旧格式只有单个 message_id，归属 owner 未知，用固定键占位以统一遍历。
+        return {"legacy": legacy}
+
+    @staticmethod
+    def _iter_message_ids(message_ids: dict):
+        for mid in message_ids.values():
+            if mid:
+                yield mid
+
     def _reconcile_overview(self, owners) -> None:
         counts, pending = self._overview_data()
         updated_at = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -399,17 +417,21 @@ class Service:
             counts, pending, updated_at=updated_at, epoch=self.store.epoch
         )
         state = self.store.overview_state()
-        message_id = state.get("message_id") or ""
+        message_ids = self._overview_message_ids(state)
         first_sent = state.get("first_sent") or 0
-        if state.get("hash") == digest and message_id:
-            return  # 业务状态无变化，不调用 PATCH
 
         now = time.time()
-        if not message_id or now - first_sent >= 13 * 86400:
-            if message_id:
+        # 13 天轮换判断必须提前到防抖之前：即使业务状态无变化，满 13 天也要归档旧卡重发新卡。
+        expired = bool(message_ids) and (now - first_sent >= 13 * 86400)
+        if not expired and state.get("hash") == digest and message_ids:
+            return  # 业务状态无变化且未满 13 天，不调用 PATCH
+
+        if not message_ids or expired:
+            # 归档全部旧卡（按 owner 逐张刷灰），避免多 owner 卡片沦为孤儿。
+            for old_mid in self._iter_message_ids(message_ids):
                 try:
                     self.lark.patch_card(
-                        message_id,
+                        old_mid,
                         cards.overview_card(counts, pending, updated_at=updated_at, archived=True),
                     )
                 except Exception as exc:
@@ -424,7 +446,7 @@ class Service:
                 except Exception as exc:
                     self.logger.warning("发送总览卡失败：%s", exc)
             if new_message_ids:
-                message_id = next(iter(new_message_ids.values()))
+                message_ids = new_message_ids
                 first_sent = now
                 # 无置顶权兜底：向会话发送指向新卡 message_id 的明确指引。
                 for owner, mid in new_message_ids.items():
@@ -437,12 +459,14 @@ class Service:
                     except Exception as exc:
                         self.logger.warning("发送总览指引失败：%s", exc)
         else:
-            try:
-                self.lark.patch_card(message_id, card)
-            except Exception as exc:
-                self.logger.warning("更新总览卡失败：%s", exc)
+            # 更新全部 owner 的旧卡，多 owner 逐张回刷，不落下任何一张。
+            for old_mid in self._iter_message_ids(message_ids):
+                try:
+                    self.lark.patch_card(old_mid, card)
+                except Exception as exc:
+                    self.logger.warning("更新总览卡失败：%s", exc)
         self.store.save_overview_state(
-            {"hash": digest, "message_id": message_id, "first_sent": first_sent}
+            {"hash": digest, "message_ids": message_ids, "first_sent": first_sent}
         )
 
     # ---------- 生命周期 ----------

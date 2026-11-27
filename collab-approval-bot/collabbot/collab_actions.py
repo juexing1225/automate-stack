@@ -65,6 +65,7 @@ class Result:
     retry_sha: Optional[str] = None
     warning: bool = False
     retry_labels_issue: Optional[int] = None
+    retry_labels_sha: Optional[str] = None
 
 
 class Collab:
@@ -401,18 +402,32 @@ class Collab:
             )
             return Result(False, "已写返工评论，但未找到关联工单", detail, warning=True)
 
-        return self._apply_rework_labels(number, issue_no, output, commented=True)
+        return self._apply_rework_labels(number, issue_no, output, commented=True, sha=head)
 
-    def sync_rework_labels(self, number: int, issue_no: int) -> Result:
+    def sync_rework_labels(self, number: int, issue_no: int, sha: str = "") -> Result:
         """幂等补切标签：复用原返工决定，仅补加/移除标签，绝不重发 PR 评论。"""
-        return self._apply_rework_labels(number, issue_no, "", commented=False)
+        return self._apply_rework_labels(number, issue_no, "", commented=False, sha=sha)
 
-    def _apply_rework_labels(self, number, issue_no, comment_output, commented) -> Result:
+    def _apply_rework_labels(self, number, issue_no, comment_output, commented, sha="") -> Result:
         # 先读当前标签集合，仅移除实际存在的旧状态标签，避免对不存在标签报错而误报失败。
+        # fail-closed：读取工单标签失败时严禁静默置空，必须中止标签变更并返回可重试结果。
         try:
             issue = self.issue_view(issue_no)
         except RuntimeError:
-            issue = {}
+            detail = (
+                "⚠️ 读取工单 #%s 标签失败，未做任何标签修改（fail-closed）。"
+                "请点击「重试同步标签」仅补切标签，不会重复写返工评论。"
+            ) % issue_no
+            if commented:
+                detail = comment_output + "\n\n" + detail
+            return Result(
+                False,
+                "⚠️ 评论已写，但读取工单标签失败（未修改标签）" if commented else "⚠️ 读取工单标签失败（未修改标签）",
+                detail,
+                warning=True,
+                retry_labels_issue=issue_no,
+                retry_labels_sha=sha,
+            )
         current_labels = set(self.label_names(issue))
 
         done = []
@@ -435,6 +450,7 @@ class Collab:
                     detail,
                     warning=True,
                     retry_labels_issue=issue_no,
+                    retry_labels_sha=sha,
                 )
             done.append("工单 #%s 加 status:rework：成功" % issue_no)
         # ② 仅移除实际存在的旧状态标签。
@@ -467,6 +483,7 @@ class Collab:
                 detail,
                 warning=True,
                 retry_labels_issue=issue_no,
+                retry_labels_sha=sha,
             )
         return Result(
             True,

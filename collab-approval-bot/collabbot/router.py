@@ -404,7 +404,7 @@ class Router:
             return
 
         current_sha = pr.get("headRefOid") or ""
-        if name in ("accept_merge", "accept_only", "rework", "retry_merge"):
+        if name in ("accept_merge", "accept_only", "rework", "retry_merge", "retry_labels"):
             if not sha:
                 self._update(
                     event,
@@ -569,12 +569,29 @@ class Router:
                     operator,
                 )
                 return
+            # 关联工单绑定：PR 的 collab:issue 若已变化，则旧卡零写入并提示刷新。
+            current_issue = self.collab.issue_number(pr)
+            if current_issue != issue_no:
+                self._update(
+                    event,
+                    cards.result_card(
+                        "工单关联已变化",
+                        "PR #%s 的关联工单已变更（卡片 #%s → 当前 #%s），请刷新卡片后重新操作（未做任何变更）。"
+                        % (number, issue_no, current_issue or "无"),
+                        False,
+                        pr=number,
+                    ),
+                    "工单关联已变化，请刷新卡片。",
+                    operator,
+                )
+                self.audit.write(operator, "card:retry_labels", str(number), "issue-changed")
+                return
             decision_key = self._decision_key(number, sha)
             if not self.store.decision_in_progress(decision_key):
                 self._conflict_update(event, operator, number)
                 return
             try:
-                result = self.collab.sync_rework_labels(number, issue_no)
+                result = self.collab.sync_rework_labels(number, issue_no, sha)
             finally:
                 self.store.finish_decision(decision_key)
             self.audit.write(
@@ -591,6 +608,7 @@ class Router:
                     warning=not result.ok,
                     epoch=self.store.epoch,
                     retry_labels_issue=issue_no if result.retry_labels_issue else None,
+                    retry_labels_sha=result.retry_labels_sha,
                 ),
                 "%s\n\n%s" % (result.title, result.detail[:2500]),
                 operator,
@@ -654,6 +672,7 @@ class Router:
                     warning=result.warning,
                     epoch=self.store.epoch,
                     retry_labels_issue=result.retry_labels_issue,
+                    retry_labels_sha=result.retry_labels_sha,
                 ),
                 "%s\n\n%s" % (result.title, result.detail[:2500]),
                 operator,
