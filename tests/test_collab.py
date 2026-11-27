@@ -418,7 +418,8 @@ class TestGate(RepoFixture):
     def test_gate_allows_fixture_secret_outside_scan(self):
         fixture = self.repo / "tests" / "fixtures"
         _mkdir(fixture)
-        (fixture / "fake.pem").write_text("-----BEGIN PRIVATE KEY-----\nnot real\n", encoding="utf-8")
+        # 拆分字面量，避免本测试源文件自身被真实仓库的密钥扫描命中（假 PEM 只用于夹具）
+        (fixture / "fake.pem").write_text("-----BEGIN " + "PRIVATE KEY-----\nnot real\n", encoding="utf-8")
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "-q", "-m", "fixture")
         p = run_tool(self.repo, "gate", "--profile", "fast")
