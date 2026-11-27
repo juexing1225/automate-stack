@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.collab.approval-bot</string>
+  <key>UserName</key>
+  <string>__USER_NAME__</string>
+  <key>GroupName</key>
+  <string>staff</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/python3</string>
+    <string>__ROOT__/run.py</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__ROOT__</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+    <key>LARKSUITE_CLI_CONFIG_DIR</key>
+    <string>__HOME__/.lark-cli-collab</string>
+    <key>COLLAB_REPO</key>
+    <string>__REPO__</string>
+    <key>COLLAB_BOT_ENV_FILE</key>
+    <string>__ENV_FILE__</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>15</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>__HOME__/.collab-approval-bot/logs/launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>__HOME__/.collab-approval-bot/logs/launchd.err.log</string>
+</dict>
+</plist>
