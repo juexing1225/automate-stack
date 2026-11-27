@@ -13,6 +13,52 @@ class LarkError(RuntimeError):
 class Lark:
     def __init__(self, config) -> None:
         self.config = config
+        self._oapi_client = None
+
+    def _get_oapi_client(self):
+        if self._oapi_client is None:
+            try:
+                import lark_oapi as lark_sdk
+            except ImportError as exc:
+                raise LarkError("未安装 lark-oapi：请先 pip install lark-oapi") from exc
+            self._oapi_client = (
+                lark_sdk.Client.builder()
+                .app_id(self.config.feishu_app_id)
+                .app_secret(self.config.feishu_app_secret)
+                .log_level(lark_sdk.LogLevel.WARNING)
+                .build()
+            )
+        return self._oapi_client
+
+    def _api_oapi(self, method: str, path: str, params=None, data=None) -> dict:
+        import lark_oapi as lark_sdk
+        from lark_oapi.core.enum import AccessTokenType, HttpMethod
+
+        client = self._get_oapi_client()
+        http_method = getattr(HttpMethod, method.upper())
+        builder = (
+            lark_sdk.BaseRequest.builder()
+            .http_method(http_method)
+            .uri(path)
+            .token_types({AccessTokenType.TENANT})
+        )
+        if params:
+            builder = builder.queries([(str(k), str(v)) for k, v in params.items()])
+        if data is not None:
+            builder = builder.body(data)
+        resp = client.request(builder.build())
+        raw_content = getattr(resp, "raw", None)
+        body_bytes = getattr(raw_content, "content", b"") if raw_content else b""
+        payload = {}
+        if body_bytes:
+            try:
+                payload = json.loads(body_bytes.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                payload = {}
+        if not resp.success():
+            msg = getattr(resp, "msg", "") or payload.get("msg") or ("code=%s" % getattr(resp, "code", "?"))
+            raise LarkError("飞书 API 调用失败（%s %s）：%s" % (method, path, msg))
+        return payload.get("data") or payload.get("bot") or {}
 
     def _run(self, args, stdin_text: Optional[str] = None, timeout: int = 60) -> dict:
         command = [self.config.lark_cli] + list(args)
@@ -64,6 +110,8 @@ class Lark:
         raise LarkError(message + (("；" + hint) if hint else ""))
 
     def api(self, method: str, path: str, params=None, data=None, timeout: int = 60) -> dict:
+        if getattr(self.config, "use_oapi", False):
+            return self._api_oapi(method, path, params=params, data=data)
         args = ["api", method, path]
         if params:
             args += ["--params", json.dumps(params, ensure_ascii=False)]
@@ -77,6 +125,18 @@ class Lark:
         return payload.get("data") or {}
 
     def send_text(self, open_id: str, text: str) -> dict:
+        if getattr(self.config, "use_oapi", False):
+            self.api(
+                "POST",
+                "/open-apis/im/v1/messages",
+                params={"receive_id_type": "open_id"},
+                data={
+                    "receive_id": open_id,
+                    "msg_type": "text",
+                    "content": json.dumps({"text": text}, ensure_ascii=False),
+                },
+            )
+            return {"ok": True}
         self._run(
             ["im", "+messages-send", "--as", "bot", "--user-id", open_id, "--text", "-"],
             stdin_text=text,
@@ -85,6 +145,13 @@ class Lark:
         return {"ok": True}
 
     def send_markdown(self, open_id: str, markdown: str) -> dict:
+        if getattr(self.config, "use_oapi", False):
+            card = {
+                "config": {"wide_screen_mode": True},
+                "elements": [{"tag": "div", "text": {"tag": "lark_md", "content": markdown}}],
+            }
+            self.send_card(open_id, card)
+            return {"ok": True}
         self._run(
             [
                 "im", "+messages-send", "--as", "bot",

@@ -71,6 +71,7 @@ class Result:
 class Collab:
     def __init__(self, config) -> None:
         self.config = config
+        self._pr_cache = {}
 
     def _run(self, args, cwd=None, timeout: int = 180, redact_output: bool = True):
         try:
@@ -159,12 +160,19 @@ class Collab:
         except RuntimeError:
             return []
 
-    def pr_view(self, number: int) -> dict:
+    def pr_view(self, number: int, fresh: bool = False) -> dict:
+        now = time.time()
+        if not fresh:
+            cached = self._pr_cache.get(number)
+            if cached and (now - cached[0]) < 3.0:
+                return dict(cached[1])
         fields = (
             "number,title,state,headRefOid,url,labels,author,body,mergeable,"
             "mergeStateStatus,reviewDecision,changedFiles,additions,deletions,comments"
         )
-        return self._gh_json(["pr", "view", str(number), "--json", fields])
+        data = self._gh_json(["pr", "view", str(number), "--json", fields])
+        self._pr_cache[number] = (now, dict(data))
+        return data
 
     def issue_view(self, number: int) -> dict:
         return self._gh_json(
@@ -318,8 +326,9 @@ class Collab:
         if rc != 0:
             return Result(False, "终审验收未通过", output)
 
-        # accept 期间仍可能进新提交；合并前再读一次，避免把未确认的 SHA 合进去。
-        latest = self.pr_view(number)
+        # accept 期间仍可能进新提交；合并前强制穿透缓存再读一次，避免把未确认的 SHA 合进去。
+        self._pr_cache.pop(number, None)
+        latest = self.pr_view(number, fresh=True)
         latest_head = latest.get("headRefOid") or ""
         if latest_head != expected_sha:
             return Result(
@@ -360,6 +369,7 @@ class Collab:
             ["pr", "merge", str(number), "--squash", "--match-head-commit", sha],
             timeout=180,
         )
+        self._pr_cache.pop(number, None)
         if rc != 0:
             return Result(False, "⚠️ 合并仍未完成", output, retry_sha=sha)
         return Result(True, "✅ 重试合并成功", output)

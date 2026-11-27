@@ -171,6 +171,8 @@ def approval_card(pr: dict, issue: dict, review: dict, warning: str = "", epoch:
         lines.append("**%s**" % pr.get("title"))
     lines.append("")
     lines.append("卡片绑定当前 SHA；若 PR 有新提交，操作会被拒绝并要求刷新。")
+    if warning:
+        lines.append("**状态**：%s" % warning)
 
     elements = [_md("\n".join(lines)), {"tag": "hr"}]
     merge_value = {"a": "accept_merge", "pr": number, "sha": head, "epoch": epoch}

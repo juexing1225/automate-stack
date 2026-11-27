@@ -22,6 +22,50 @@ EVENT_KEYS = ("im.message.receive_v1", "card.action.trigger")
 FORBIDDEN_APP_IDS = {"cli_aa60277cb9f85ce1"}  # 已连 SuperAgent 的机器人，不能复用
 
 
+def normalize_oapi_message(data) -> dict:
+    """将 lark-oapi P2ImMessageReceiveV1 对象归一化为 Router 标准事件字典。"""
+    ev = getattr(data, "event", None)
+    sender = getattr(ev, "sender", None)
+    sender_id = getattr(sender, "sender_id", None)
+    msg = getattr(ev, "message", None)
+    raw_content = getattr(msg, "content", "") or ""
+    text = raw_content
+    if getattr(msg, "message_type", "") == "text" and isinstance(raw_content, str):
+        try:
+            parsed = json.loads(raw_content)
+            if isinstance(parsed, dict) and "text" in parsed:
+                text = str(parsed.get("text") or "")
+        except ValueError:
+            pass
+    return {
+        "sender_type": getattr(sender, "sender_type", "") or "",
+        "sender_id": getattr(sender_id, "open_id", "") or "",
+        "message_id": getattr(msg, "message_id", "") or "",
+        "chat_type": getattr(msg, "chat_type", "") or "",
+        "content": text,
+    }
+
+
+def normalize_oapi_card(data) -> dict:
+    """将 lark-oapi P2CardActionTrigger 对象归一化为 Router 标准事件字典。"""
+    header = getattr(data, "header", None)
+    ev = getattr(data, "event", None)
+    operator = getattr(ev, "operator", None)
+    action = getattr(ev, "action", None)
+    return {
+        "event_id": getattr(header, "event_id", "") or getattr(data, "uuid", "") or "",
+        "operator_id": getattr(operator, "open_id", "") or "",
+        "token": getattr(ev, "token", "") or "",
+        "action": {
+            "tag": getattr(action, "tag", "") or "",
+            "name": getattr(action, "name", "") or "",
+            "value": getattr(action, "value", None),
+            "form_value": getattr(action, "form_value", None),
+            "input_value": getattr(action, "input_value", None),
+        },
+    }
+
+
 class Service:
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -74,46 +118,62 @@ class Service:
                     % (len(info["dirty"]), self.config.repo)
                 )
 
-        if not Path(self.config.lark_cli).is_file():
-            fatal.append("找不到 lark-cli：%s" % self.config.lark_cli)
-
-        cfg_path = Path(self.config.lark_config_dir) / "config.json"
         has_lark_config = False
-        if not cfg_path.is_file():
-            fatal.append(
-                "飞书应用尚未初始化：%s 不存在。请先运行 "
-                "LARKSUITE_CLI_CONFIG_DIR=%s %s config init --new"
-                % (cfg_path, self.config.lark_config_dir, self.config.lark_cli)
-            )
-        else:
-            try:
-                data = json.loads(cfg_path.read_text("utf-8"))
-                apps = data.get("apps") or []
-                first = apps[0] if isinstance(apps, list) and apps else {}
-                if not isinstance(first, dict):
-                    first = {}
-                app_obj = data.get("app")
-                if not isinstance(app_obj, dict):
-                    app_obj = {}
-                app_id = str(
-                    first.get("appId")
-                    or first.get("app_id")
-                    or data.get("appId")
-                    or data.get("app_id")
-                    or app_obj.get("appId", "")
+        if getattr(self.config, "use_oapi", False):
+            app_id = self.config.feishu_app_id
+            if app_id in FORBIDDEN_APP_IDS:
+                fatal.append(
+                    "飞书配置指向已连 SuperAgent 的机器人（%s），会抢事件、串身份；"
+                    "必须使用独立审批官应用。" % app_id
                 )
-                if not app_id:
-                    fatal.append("飞书配置里没有 appId：%s" % cfg_path)
-                elif app_id in FORBIDDEN_APP_IDS:
-                    fatal.append(
-                        "飞书配置指向已连 SuperAgent 的机器人（%s），会抢事件、串身份；"
-                        "必须用独立目录新建应用。" % app_id
-                    )
+            else:
+                try:
+                    import lark_oapi  # noqa: F401
+                except ImportError:
+                    fatal.append("已配置 FEISHU_APP_ID/SECRET 但未安装 lark-oapi，请先 pip install lark-oapi")
                 else:
-                    notes.append("飞书应用：%s…" % app_id[:12])
+                    notes.append("飞书官方 SDK 模式：%s…" % app_id[:12])
                     has_lark_config = True
-            except (OSError, ValueError) as exc:
-                fatal.append("飞书配置无法解析：%s" % exc)
+        else:
+            if not Path(self.config.lark_cli).is_file():
+                fatal.append("找不到 lark-cli：%s" % self.config.lark_cli)
+
+            cfg_path = Path(self.config.lark_config_dir) / "config.json"
+            if not cfg_path.is_file():
+                fatal.append(
+                    "飞书应用尚未初始化：%s 不存在。请先运行 "
+                    "LARKSUITE_CLI_CONFIG_DIR=%s %s config init --new"
+                    % (cfg_path, self.config.lark_config_dir, self.config.lark_cli)
+                )
+            else:
+                try:
+                    data = json.loads(cfg_path.read_text("utf-8"))
+                    apps = data.get("apps") or []
+                    first = apps[0] if isinstance(apps, list) and apps else {}
+                    if not isinstance(first, dict):
+                        first = {}
+                    app_obj = data.get("app")
+                    if not isinstance(app_obj, dict):
+                        app_obj = {}
+                    app_id = str(
+                        first.get("appId")
+                        or first.get("app_id")
+                        or data.get("appId")
+                        or data.get("app_id")
+                        or app_obj.get("appId", "")
+                    )
+                    if not app_id:
+                        fatal.append("飞书配置里没有 appId：%s" % cfg_path)
+                    elif app_id in FORBIDDEN_APP_IDS:
+                        fatal.append(
+                            "飞书配置指向已连 SuperAgent 的机器人（%s），会抢事件、串身份；"
+                            "必须用独立目录新建应用。" % app_id
+                        )
+                    else:
+                        notes.append("飞书应用：%s…" % app_id[:12])
+                        has_lark_config = True
+                except (OSError, ValueError) as exc:
+                    fatal.append("飞书配置无法解析：%s" % exc)
 
         rc, output = self.collab.gh_auth_status()
         if rc != 0:
@@ -133,23 +193,86 @@ class Service:
         return fatal, notes
 
     def start_consumers(self) -> None:
-        for key in EVENT_KEYS:
-            handler = (
-                self.router.handle_message
-                if key == "im.message.receive_v1"
-                else self.router.handle_card
-            )
+        if getattr(self.config, "use_oapi", False):
             thread = threading.Thread(
-                target=self._consume,
-                args=(key, handler),
-                name="consume-" + key,
-                daemon=True,
+                target=self._consume_oapi, name="consume-oapi-ws", daemon=True
             )
             thread.start()
+        else:
+            for key in EVENT_KEYS:
+                handler = (
+                    self.router.handle_message
+                    if key == "im.message.receive_v1"
+                    else self.router.handle_card
+                )
+                thread = threading.Thread(
+                    target=self._consume,
+                    args=(key, handler),
+                    name="consume-" + key,
+                    daemon=True,
+                )
+                thread.start()
         thread = threading.Thread(
             target=self._reconcile_loop, name="reconcile", daemon=True
         )
         thread.start()
+
+    def _consume_oapi(self) -> None:
+        """飞书官方 lark-oapi WebSocket 长连接消费（支持卡片回调同步原生 Toast）。"""
+        import asyncio
+        import lark_oapi as lark_sdk
+        from lark_oapi.event.callback.model.p2_card_action_trigger import (
+            CallBackToast,
+            P2CardActionTriggerResponse,
+        )
+
+        def on_message(data):
+            event = normalize_oapi_message(data)
+            if event.get("message_id"):
+                try:
+                    self.pool.submit(self.router.handle_message, event)
+                except RuntimeError:
+                    pass
+
+        def on_card(data):
+            event = normalize_oapi_card(data)
+            toast_type, toast_msg = self.router.preview_card_toast(event)
+            event["_toast_sent"] = True
+            if event.get("event_id"):
+                try:
+                    self.pool.submit(self.router.handle_card, event)
+                except RuntimeError:
+                    pass
+            resp = P2CardActionTriggerResponse()
+            toast = CallBackToast()
+            toast.type = toast_type
+            toast.content = toast_msg
+            resp.toast = toast
+            return resp
+
+        dispatcher = (
+            lark_sdk.EventDispatcherHandler.builder("", "")
+            .register_p2_im_message_receive_v1(on_message)
+            .register_p2_card_action_trigger(on_card)
+            .build()
+        )
+        while not self.stop.is_set():
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                self.logger.info("启动飞书官方 WebSocket 长连接（lark-oapi）")
+                ws_client = lark_sdk.ws.Client(
+                    self.config.feishu_app_id,
+                    self.config.feishu_app_secret,
+                    event_handler=dispatcher,
+                    log_level=lark_sdk.LogLevel.WARNING,
+                    auto_reconnect=True,
+                )
+                ws_client.start()
+            except Exception as exc:
+                self.logger.warning("飞书官方长连接异常：%s，3 秒后重连", exc)
+            if not self.stop.is_set():
+                self.stop.wait(3)
 
     # ---------- 事件消费 ----------
 

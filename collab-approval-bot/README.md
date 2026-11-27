@@ -113,6 +113,7 @@ chmod 600 ~/.config/collab/feishu.env
 | `COLLAB_BOT_OWNER_IDS` | 空 | 预置主人 open_id，逗号分隔 |
 | `COLLAB_BOT_ALLOW_GROUP` | `false` | 是否响应群聊 |
 | `COLLAB_BOT_LARK_CLI` | `~/.local/bin/lark-cli` | lark-cli 路径 |
+| `FEISHU_APP_ID` / `FEISHU_APP_SECRET` | 空 | 可选：二者同时配置即改用官方 SDK（lark-oapi）长连接模式，支持原生 Toast 与卡片 JSON 2.0；需 `pip install lark-oapi` |
 
 ## 启动与绑定
 

@@ -77,6 +77,8 @@ class Config:
         self.lark_config_dir = _path(
             _env("LARKSUITE_CLI_CONFIG_DIR", "~/.lark-cli-collab")
         )
+        self.feishu_app_id = _env("FEISHU_APP_ID", "").strip()
+        self.feishu_app_secret = _env("FEISHU_APP_SECRET", "").strip()
         self.app_name = _env("COLLAB_BOT_APP_NAME", "Collab")
         self.log_level = _env("COLLAB_BOT_LOG_LEVEL", "INFO").upper()
 
@@ -95,6 +97,10 @@ class Config:
     @property
     def collab_py(self) -> Path:
         return self.repo / "scripts" / "collab.py"
+
+    @property
+    def use_oapi(self) -> bool:
+        return bool(self.feishu_app_id and self.feishu_app_secret)
 
     def child_env(self, include_lark: bool = False) -> dict:
         # 白名单最小环境：只透传运行 collab.py / gh / git 所需的变量，

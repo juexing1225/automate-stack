@@ -258,6 +258,92 @@ class Router:
 
     # ---------- 卡片回调 ----------
 
+    @staticmethod
+    def _parse_card_action(event: dict):
+        action = event.get("action")
+        if not isinstance(action, dict):
+            action = {
+                "tag": event.get("action_tag"),
+                "name": event.get("action_name"),
+                "value": event.get("action_value"),
+                "form_value": event.get("form_value"),
+                "input_value": event.get("input_value"),
+            }
+        value = action.get("value")
+        if isinstance(value, str):
+            raw = value.strip()
+            try:
+                value = json.loads(raw) if raw.startswith("{") else {}
+            except ValueError:
+                value = {}
+        if not isinstance(value, dict):
+            value = {}
+        raw_name = str(action.get("name") or "")
+        encoded = raw_name.split(":") if raw_name.startswith("rework:") else []
+        name = str(value.get("a") or "")
+        if not name and encoded:
+            name = "rework"
+        if not name:
+            name = str(action.get("tag") or "")
+        try:
+            number = int(value.get("pr"))
+        except (TypeError, ValueError):
+            number = 0
+        sha = str(value.get("sha") or "")
+        if number <= 0 and len(encoded) >= 3:
+            try:
+                number = int(encoded[1])
+            except (TypeError, ValueError):
+                number = 0
+            sha = sha or encoded[2]
+        card_epoch = str(value.get("epoch") or "")
+        if not card_epoch and len(encoded) >= 4:
+            card_epoch = encoded[3]
+        rework_note = ""
+        if name == "rework":
+            form_value = action.get("form_value")
+            if isinstance(form_value, dict):
+                rework_note = str(form_value.get("note") or "")
+            elif isinstance(form_value, str) and form_value.strip():
+                try:
+                    rework_note = str(json.loads(form_value).get("note") or "")
+                except ValueError:
+                    rework_note = ""
+            if not rework_note:
+                rework_note = str(action.get("input_value") or "")
+            rework_note = rework_note.strip()
+        return action, value, name, number, sha, card_epoch, rework_note
+
+    def preview_card_toast(self, event: dict):
+        """纯内存 <1ms 预览卡片回调结果，供 lark-oapi 同步返回飞书原生 Toast 气泡。"""
+        operator = str(event.get("operator_id") or "").strip()
+        if not operator or not self.store.is_owner(operator):
+            return "error", "你不在审批官白名单里，无法操作。"
+        _, _, name, number, sha, card_epoch, rework_note = self._parse_card_action(event)
+        if name == "dismiss":
+            return "info", "已取消操作。"
+        if name == "refresh_overview":
+            return "info", "⏳ 正在刷新协作总览…"
+        if number <= 0:
+            return "warning", "卡片缺少 PR 编号，请重新生成。"
+        write_actions = ("accept_merge", "accept_only", "rework", "retry_merge", "retry_labels")
+        if name in write_actions:
+            if self.store.epoch and card_epoch != self.store.epoch:
+                return "warning", "实例已重启，卡片已过期，请重新获取。"
+            if not sha:
+                return "warning", "卡片缺少 SHA，请重新发送 /card。"
+        if name == "rework" and not rework_note:
+            return "warning", "打回返工必须填写意见。"
+        labels = {
+            "accept_merge": "⏳ 已收到，正在执行终审与合并…",
+            "accept_only": "⏳ 已收到，正在执行终审验收…",
+            "retry_merge": "⏳ 已收到，正在重试合并…",
+            "retry_labels": "⏳ 已收到，正在重试同步标签…",
+            "rework": "⏳ 已收到，正在打回返工…",
+            "refresh": "⏳ 正在刷新卡片…",
+        }
+        return "info", labels.get(name, "⏳ 已收到，正在处理…")
+
     def handle_card(self, event: dict) -> None:
         try:
             self._handle_card(event)
@@ -357,8 +443,10 @@ class Router:
             )
             return
 
+        write_actions = ("accept_merge", "accept_only", "rework", "retry_merge", "retry_labels")
+
         # 实例纪元校验：缓存全丢重启后 boot_epoch 会换新，旧卡按钮必须安全拒绝（0 GitHub 写入）。
-        if name in ("accept_merge", "accept_only", "rework", "retry_merge", "retry_labels"):
+        if name in write_actions:
             card_epoch = str(value.get("epoch") or "")
             if not card_epoch and len(encoded) >= 4:
                 card_epoch = encoded[3]
@@ -376,6 +464,54 @@ class Router:
                     operator,
                 )
                 return
+            if not sha:
+                self._update(
+                    event,
+                    cards.result_card(
+                        "卡片缺少 SHA",
+                        "无法确认操作对象，请重新发送 /card %s 生成新卡片。" % number,
+                        False,
+                        pr=number,
+                    ),
+                    "卡片缺少 SHA，请重新生成。",
+                    operator,
+                )
+                self.audit.write(operator, "card:" + name, str(number), "no-sha")
+                return
+
+        rework_note = ""
+        if name == "rework":
+            form_value = action.get("form_value")
+            if isinstance(form_value, dict):
+                rework_note = str(form_value.get("note") or "")
+            elif isinstance(form_value, str) and form_value.strip():
+                try:
+                    rework_note = str(json.loads(form_value).get("note") or "")
+                except ValueError:
+                    rework_note = ""
+            if not rework_note:
+                rework_note = str(action.get("input_value") or "")
+            rework_note = rework_note.strip()
+
+        # 写操作在调用任何 gh 之前先即时回刷无按钮过渡态（1 秒内反馈 + 天然防连点）；
+        # rework 空输入不闪过渡态，直接走下方必填提示。
+        progress_labels = {
+            "accept_merge": ("⏳ 正在执行终审与合并…", "正在校验 SHA 并依次执行 `collab.py accept` 与合并，请稍候。"),
+            "accept_only": ("⏳ 正在执行终审验收…", "正在校验 SHA 并执行 `collab.py accept`，请稍候。"),
+            "retry_merge": ("⏳ 正在重试合并…", "正在核对 SHA 并仅重跑合并（不重复验收），请稍候。"),
+            "retry_labels": ("⏳ 正在重试同步标签…", "正在核对 SHA 与关联工单并补切标签，请稍候。"),
+            "rework": ("⏳ 正在打回返工…", "正在写入返工意见并切换工单状态，请稍候。"),
+        }
+        if not event.get("_toast_sent") and name in progress_labels and (name != "rework" or rework_note):
+            p_title, p_detail = progress_labels[name]
+            self._update(
+                event,
+                cards.result_card(
+                    p_title, p_detail, True, pr=number, terminal=True, epoch=self.store.epoch
+                ),
+                p_title,
+                operator,
+            )
 
         started = time.time()
         try:
@@ -423,47 +559,23 @@ class Router:
             return
 
         current_sha = pr.get("headRefOid") or ""
-        if name in ("accept_merge", "accept_only", "rework", "retry_merge", "retry_labels"):
-            if not sha:
-                self._update(
-                    event,
-                    cards.result_card(
-                        "卡片缺少 SHA",
-                        "无法确认操作对象，请重新发送 /card %s 生成新卡片。" % number,
-                        False,
-                        pr=number,
-                    ),
-                    "卡片缺少 SHA，请重新生成。",
-                    operator,
-                )
-                self.audit.write(operator, "card:" + name, str(number), "no-sha")
-                return
-            if sha and current_sha != sha:
-                issue_no = self.collab.issue_number(pr)
-                issue = {}
-                if issue_no:
-                    try:
-                        issue = self.collab.issue_view(issue_no)
-                    except Exception:
-                        issue = {}
-                review = self.collab.latest_review(pr)
-                card = cards.approval_card(
-                    pr,
-                    issue,
-                    review,
-                    warning="PR 已有新提交（卡片 %s → 当前 %s），请重新确认。"
+        if name in write_actions and sha and current_sha != sha:
+            # SHA 漂移时直接作废旧卡并移除「通过并合并」按钮，杜绝二次误点盲合并新提交。
+            self._update(
+                event,
+                cards.result_card(
+                    "⚠️ PR 已有新提交，旧卡已作废",
+                    "旧卡绑定 SHA %s，当前为 %s。为防误合新提交，本卡已作废；请点击下方「刷新卡片」查看最新变更后再确认。"
                     % (sha[:7], current_sha[:7]),
+                    False,
+                    pr=number,
                     epoch=self.store.epoch,
-                )
-                self._update(
-                    event,
-                    card,
-                    "PR #%s 已有新提交，卡片上的 SHA 已过期，请刷新后重新确认。"
-                    % number,
-                    operator,
-                )
-                self.audit.write(operator, "card:" + name, str(number), "stale")
-                return
+                ),
+                "PR #%s 已有新提交，旧卡已作废，请刷新后重新确认。" % number,
+                operator,
+            )
+            self.audit.write(operator, "card:" + name, str(number), "stale")
+            return
 
         if name == "refresh":
             issue_no = self.collab.issue_number(pr)
@@ -485,17 +597,6 @@ class Router:
             if not self.store.decision_in_progress(decision_key):
                 self._conflict_update(event, operator, number)
                 return
-            self._update(
-                event,
-                cards.result_card(
-                    "正在执行终审…",
-                    "先跑 `collab.py accept`，再按 SHA 合并。请稍候。",
-                    True,
-                    pr=number,
-                ),
-                "正在执行终审与合并，请稍候…",
-                operator,
-            )
             try:
                 result = self.collab.accept_and_merge(number, sha)
             finally:
@@ -669,18 +770,7 @@ class Router:
             return
 
         if name == "rework":
-            note = ""
-            form_value = action.get("form_value")
-            if isinstance(form_value, dict):
-                note = str(form_value.get("note") or "")
-            elif isinstance(form_value, str) and form_value.strip():
-                try:
-                    note = str(json.loads(form_value).get("note") or "")
-                except ValueError:
-                    note = ""
-            if not note:
-                note = str(action.get("input_value") or "")
-            note = note.strip()
+            note = rework_note
             if not note:
                 issue_no = self.collab.issue_number(pr)
                 issue = {}
